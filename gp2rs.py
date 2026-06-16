@@ -146,10 +146,17 @@ class GPSong:
         tun = self.tuning(ti)
         if all(t == 0 for t in tun):
             return None
+        # Non-guitar/bass instruments — exclude before falling through to "guitar"
+        _non_guitar = ("drum", "perc", "vocal", "voc", "voice", "choir",
+                       "sax", "tenor", "alto", "soprano", "baritone",
+                       "trumpet", "trombone", "horn", "brass", "wind",
+                       "flute", "clarinet", "oboe", "violin", "viola",
+                       "cello", "fiddle", "piano", "keys", "keyboard",
+                       "organ", "synth", "strings", "orchestra")
+        if any(k in name for k in _non_guitar):
+            return None
         if "bass" in name or len(tun) <= 5 and max(tun) < 50:
             return "bass"
-        if "drum" in name or "perc" in name:
-            return None
         return "guitar"
 
     def effective_tuning(self, ti):
