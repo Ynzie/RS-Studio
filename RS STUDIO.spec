@@ -6,10 +6,10 @@ hiddenimports += collect_submodules('PIL')
 
 
 a = Analysis(
-    ['C:\\Users\\ynzer\\Downloads\\python thing\\gp2rs_studio.py'],
+    ['C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\gp2rs_studio.py'],
     pathex=[],
-    binaries=[('C:\\Users\\ynzer\\Downloads\\python thing\\ffmpeg.exe', '.')],
-    datas=[('C:\\Users\\ynzer\\Downloads\\python thing\\gp2rs.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\gp2rs_studio.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\cst_template.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\wwise_convert.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\rs_studio.ico', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\rs_studio.png', '.')],
+    binaries=[('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\ffmpeg.exe', '.')],
+    datas=[('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\gp2rs.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\gp2rs_studio.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\cst_template.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\wwise_convert.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\rs_studio.ico', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\rs_studio.png', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -39,5 +39,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Users\\ynzer\\Downloads\\python thing\\rs_studio.ico'],
+    icon=['C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\rs_studio.ico'],
 )

@@ -1,0 +1,32 @@
+# ── Build output ──────────────────────────────────────────
+dist/
+build/
+*.spec
+
+# ── Python cache ──────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Bundled binaries (too large for git; build_exe.bat fetches them) ──
+ffmpeg.exe
+ffplay.exe
+yt-dlp.exe
+
+# ── Oversized source assets ───────────────────────────────
+icon.png
+
+# ── User-specific runtime data ────────────────────────────
+settings.json
+
+# ── Junk / scratch ────────────────────────────────────────
+New folder/
+DeadPoetSocietyCoDa/
+"wav)"
+*.tmp
+*.log
+01-Screenshot*
+
+# ── OS files ──────────────────────────────────────────────
+Thumbs.db
+.DS_Store

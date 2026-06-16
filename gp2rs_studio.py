@@ -372,7 +372,55 @@ def extract_gp_note_onsets(path, track_index=0):
         return []
 
 
-def stretch_audio_to_gp(input_path, output_path, tempo_events_sec, audio_duration, log=print):
+def extract_gp_total_seconds(path):
+    """
+    Returns the expected total song duration in seconds by walking MasterBars
+    and applying the GP tempo map. Returns None on failure.
+    """
+    try:
+        import xml.etree.ElementTree as ET
+        with zipfile.ZipFile(path) as z:
+            gpif_name = next((n for n in z.namelist() if n.lower().endswith("score.gpif")), None)
+            if not gpif_name:
+                return None
+            data = z.read(gpif_name)
+        root_el = ET.fromstring(data)
+
+        tempo_events, tpb = extract_gp_tempo_map(path)
+        if not tempo_events:
+            tempo_events = [(0, 120)]
+
+        # Count total ticks by summing every MasterBar's duration
+        total_ticks = 0
+        for mb in root_el.iter("MasterBar"):
+            try:
+                num = int(mb.findtext("Time/Numerator") or "4")
+                den = int(mb.findtext("Time/Denominator") or "4")
+            except ValueError:
+                num, den = 4, 4
+            total_ticks += int(tpb * 4 * num / den)
+
+        if total_ticks <= 0:
+            return None
+
+        # Convert total ticks → seconds using the tempo map
+        cur_sec  = 0.0
+        cur_tick = 0
+        cur_bpm  = tempo_events[0][1]
+        for ev_tick, ev_bpm in tempo_events:
+            if total_ticks <= ev_tick:
+                break
+            cur_sec  += (ev_tick - cur_tick) / tpb * (60.0 / cur_bpm)
+            cur_tick  = ev_tick
+            cur_bpm   = ev_bpm
+        cur_sec += (total_ticks - cur_tick) / tpb * (60.0 / cur_bpm)
+        return cur_sec
+    except Exception:
+        return None
+
+
+def stretch_audio_to_gp(input_path, output_path, tempo_events_sec, audio_duration,
+                        gp_expected_duration=None, log=print):
     """
     Time-stretch input audio so that the GP tempo map aligns with the audio timeline.
     Uses ffmpeg atempo filter with per-segment speed ratios.
@@ -386,59 +434,13 @@ def stretch_audio_to_gp(input_path, output_path, tempo_events_sec, audio_duratio
     We approximate by computing the ratio of (GP expected duration) / (audio segment duration).
     atempo range is 0.5–100.0; values outside that are chained.
     """
+    import shutil as _sh
     ff = _find_exe("ffmpeg")
     if not ff:
         raise RuntimeError("ffmpeg not found")
 
-    if not tempo_events_sec or len(tempo_events_sec) < 2:
-        # Single BPM — straightforward whole-file stretch not needed (lead-in handles offset)
-        # Just copy the file
-        import shutil as _sh
-        _sh.copy2(input_path, output_path)
-        log("  [stretch] Single-tempo file — no stretch needed, copied as-is.")
-        return output_path
-
-    # Build a flat atempo filter chain.
-    # For multi-tempo songs we do a single global atempo approximation:
-    # find the median ratio across all segments and apply it.
-    # A true per-segment stretch requires splitting + reassembling which is complex;
-    # the single-ratio approach handles the common case of slightly wrong constant BPM.
-    # If the GP has genuine tempo changes, the beat grid overlay is the better guide.
-
-    # Compute GP total duration vs audio duration
-    # GP duration = sum of (beats_in_segment / bpm * 60) for each segment
-    gp_total = 0.0
-    for i, (t_sec, bpm) in enumerate(tempo_events_sec):
-        next_t = tempo_events_sec[i + 1][0] if i + 1 < len(tempo_events_sec) else audio_duration
-        seg_audio_dur = next_t - t_sec
-        # how long GP expects this segment (same audio beats, but maybe different BPM)
-        # Since we don't have beat counts per segment from here, use the ratio approach:
-        # ratio = audio_bpm / gp_bpm  (if audio plays faster than GP expects, slow it down)
-        gp_total += seg_audio_dur  # placeholder — refined below
-
-    # Better: compute the ratio segment by segment and build a weighted average
-    ratios = []
-    weights = []
-    ref_bpm = tempo_events_sec[0][1]
-    for i, (t_sec, bpm) in enumerate(tempo_events_sec):
-        next_t = tempo_events_sec[i + 1][0] if i + 1 < len(tempo_events_sec) else audio_duration
-        seg_dur = next_t - t_sec
-        if seg_dur <= 0:
-            continue
-        # ratio > 1 means speed up audio (audio is slower than GP expects)
-        # ratio < 1 means slow down audio
-        ratio = bpm / ref_bpm  # relative to first segment
-        ratios.append(ratio)
-        weights.append(seg_dur)
-
-    if not ratios:
-        import shutil as _sh
-        _sh.copy2(input_path, output_path)
-        return output_path
-
-    # Weighted average ratio
-    avg_ratio = sum(r * w for r, w in zip(ratios, weights)) / sum(weights)
-    avg_ratio = max(0.25, min(4.0, avg_ratio))
+    if audio_duration <= 0:
+        raise RuntimeError("Audio duration unknown — load the waveform first.")
 
     def _atempo_chain(ratio):
         """Build chained atempo filters for ratios outside 0.5–2.0."""
@@ -453,8 +455,43 @@ def stretch_audio_to_gp(input_path, output_path, tempo_events_sec, audio_duratio
         filters.append(f"atempo={r:.6f}")
         return ",".join(filters)
 
+    # ── Determine stretch ratio ───────────────────────────────────────────
+    # Best path: use the pre-computed GP song duration (from extract_gp_total_seconds).
+    # This gives us the definitive ratio = gp_duration / audio_duration regardless
+    # of how many tempo events exist.
+    if gp_expected_duration and gp_expected_duration > 0:
+        avg_ratio = gp_expected_duration / audio_duration
+        log(f"  [stretch] GP expected={gp_expected_duration:.3f}s  audio={audio_duration:.3f}s  ratio={avg_ratio:.6f}")
+    elif tempo_events_sec and len(tempo_events_sec) >= 2:
+        # Fallback: weighted ratio across tempo segments relative to first BPM.
+        # Less accurate but better than nothing for multi-tempo files without GP path.
+        ratios = []
+        weights = []
+        ref_bpm = tempo_events_sec[0][1]
+        for i, (t_sec, bpm) in enumerate(tempo_events_sec):
+            next_t = tempo_events_sec[i + 1][0] if i + 1 < len(tempo_events_sec) else audio_duration
+            seg_dur = next_t - t_sec
+            if seg_dur <= 0:
+                continue
+            ratios.append(bpm / ref_bpm)
+            weights.append(seg_dur)
+        avg_ratio = sum(r * w for r, w in zip(ratios, weights)) / sum(weights) if ratios else 1.0
+        log(f"  [stretch] (fallback ratio from tempo events) ratio={avg_ratio:.6f}")
+    else:
+        _sh.copy2(input_path, output_path)
+        log("  [stretch] No GP duration or tempo events — copied as-is (nothing to stretch).")
+        return output_path
+
+    avg_ratio = max(0.25, min(4.0, avg_ratio))
+
+    # If ratio is within 0.05% of 1.0, stretching would be inaudible — skip it
+    if abs(avg_ratio - 1.0) < 0.0005:
+        _sh.copy2(input_path, output_path)
+        log(f"  [stretch] Ratio {avg_ratio:.6f} is within tolerance — copied as-is.")
+        return output_path
+
     af = _atempo_chain(avg_ratio)
-    log(f"  [stretch] ratio={avg_ratio:.4f}  filter: {af}")
+    log(f"  [stretch] Applying atempo: {af}")
 
     r = subprocess.run(
         [ff, "-y", "-i", input_path, "-af", af,
@@ -930,14 +967,20 @@ def run_gui():
 
     apply_ttk_theme(root, ttk)
 
-    vars_ = {k: tk.StringVar() for k in ["gp", "lyrics", "audio", "preview_audio", "art", "out", "title", "artist", "album", "year", "leadin", "volume", "audio_url", "packer", "cst", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "bpm"]}
+    vars_ = {k: tk.StringVar() for k in ["gp", "lyrics", "audio", "preview_audio", "art", "out", "psarc_out", "title", "artist", "album", "year", "leadin", "volume", "audio_url", "packer", "cst", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "bpm"]}
     vars_["leadin"].set("5.0"); vars_["volume"].set("-8.0"); vars_["year"].set("2026"); vars_["bpm"].set("120")
     vars_["slop_url"].set("http://localhost:8000")
     vars_["appid"].set("248750"); vars_["scroll_speed"].set("1.3"); vars_["pitch"].set("440.0")
     # Restore persisted paths from settings
     _s = load_settings()
-    for _k in ("packer", "cst", "out", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "volume", "leadin"):
+    for _k in ("packer", "cst", "out", "psarc_out", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "volume", "leadin"):
         if _s.get(_k): vars_[_k].set(_s[_k])
+    # Default project folder to <exe dir>/RS Studio Projects if never set
+    if not vars_["out"].get():
+        _default_out = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "RS Studio Projects")
+        os.makedirs(_default_out, exist_ok=True)
+        vars_["out"].set(_default_out)
 
     psarc_var = tk.BooleanVar(value=True); use_ddc = tk.BooleanVar(value=True)
     # Auto-probe for packer.exe if not saved yet
@@ -1066,12 +1109,15 @@ def run_gui():
         for w in (f, icon_lbl, text_lbl): w.bind("<Enter>", _enter); w.bind("<Leave>", _leave); w.bind("<Button-1>", lambda e: show_page(target_page))
         return f
 
-    nav_label(sidebar, 3, "⬡", "Main", "main"); nav_label(sidebar, 4, "↻", "Slopsmith", "slopsmith")
-    nav_label(sidebar, 5, "◐", "Theme", "theme"); nav_label(sidebar, 6, "≡", "Log", "log")
+    nav_label(sidebar, 3, "⬡", "Main", "main")
+    nav_label(sidebar, 4, "🎛", "Audio Editor", "audioeditor")
+    nav_label(sidebar, 5, "🎸", "Slopsmith", "slopsmith")
+    nav_label(sidebar, 6, "◐", "Theme", "theme"); nav_label(sidebar, 7, "≡", "Log", "log")
+    nav_label(sidebar, 8, "?", "Help", "help")
 
-    sidebar.rowconfigure(7, weight=1)
-    btn_frame = styled(tk.Frame(sidebar), bg="bg"); btn_frame.grid(row=8, column=0, sticky="ew", padx=14, pady=(0, 20)); btn_frame.columnconfigure(0, weight=1)
-    build_btn = tk.Button(btn_frame, text="▶  Create CDLC", fg="white", activeforeground="white", relief="flat", bd=0, font=("Segoe UI Semibold", 11), cursor="hand2", pady=12, command=lambda: do_build())
+    sidebar.rowconfigure(9, weight=1)
+    btn_frame = styled(tk.Frame(sidebar), bg="bg"); btn_frame.grid(row=9, column=0, sticky="ew", padx=14, pady=(0, 20)); btn_frame.columnconfigure(0, weight=1)
+    build_btn = tk.Button(btn_frame, text="▶  Create CDLC", fg="white", activeforeground="white", relief="flat", bd=0, font=("Segoe UI Semibold", 11), cursor="hand2", pady=12, command=lambda: show_page("audioeditor"))
     styled(build_btn, bg="accent", activebackground="accent_hi"); build_btn.pack(fill="x")
 
     page_container = styled(tk.Frame(root), bg="surface")
@@ -1085,8 +1131,8 @@ def run_gui():
         refresh_theme(root, ttk)
 
     def _persist_settings(*_):
-        save_settings({k: vars_[k].get() for k in ("packer","cst","out","slop_url","slop_exe","slop_plugin_dir","appid","scroll_speed","pitch","volume","leadin")})
-    for _pk in ("packer","cst","out","slop_url","slop_exe","slop_plugin_dir","appid","scroll_speed","pitch","volume","leadin"):
+        save_settings({k: vars_[k].get() for k in ("packer","cst","out","psarc_out","slop_url","slop_exe","slop_plugin_dir","appid","scroll_speed","pitch","volume","leadin")})
+    for _pk in ("packer","cst","out","psarc_out","slop_url","slop_exe","slop_plugin_dir","appid","scroll_speed","pitch","volume","leadin"):
         vars_[_pk].trace_add("write", _persist_settings)
 
     def page_header(parent, text):
@@ -1100,7 +1146,257 @@ def run_gui():
     # PAGE: MAIN
     # ══════════════════════════════════════════════════════════════════════
     main_page = styled(tk.Frame(page_container), bg="surface"); pages["main"] = main_page
-    page_header(main_page, "Project Configuration")
+
+    # Main header with inline "New Project" button
+    _main_hdr = styled(tk.Frame(main_page), bg="bg"); _main_hdr.pack(fill="x")
+    _main_inner = styled(tk.Frame(_main_hdr), bg="bg"); _main_inner.pack(fill="x", padx=32, pady=(28, 20))
+    styled(tk.Label(_main_inner, text="Project Configuration", font=("Segoe UI Semibold", 16)),
+           fg="fg", bg="bg").pack(side="left")
+
+    def _do_new_project():
+        _stop_all_media() if "_stop_all_media" in dir() else None
+        for k in ["gp","lyrics","audio","preview_audio","art",
+                  "title","artist","audio_url"]:
+            vars_[k].set("")
+        vars_["album"].set("Unknown Album")
+        vars_["year"].set("2026")
+        try:
+            for w in arr_grid.winfo_children(): w.destroy()
+            track_rows.clear()
+        except Exception: pass
+        try: _update_player_ui()
+        except Exception: pass
+
+    tk.Button(_main_inner, text="＋  New Project", cursor="hand2",
+              font=("Segoe UI Semibold", 9), relief="flat", bd=0,
+              padx=14, pady=5, fg="white",
+              bg=COL["accent"], activebackground=COL["accent_hi"],
+              command=_do_new_project).pack(side="right")
+    styled(tk.Frame(_main_hdr, height=1), bg="border").pack(fill="x")
+
+    # ── STARTUP / RECENT BUILDS OVERLAY ───────────────────────────────────
+    startup_overlay = tk.Frame(main_page, bg=COL["surface"])
+
+    def _get_recent_projects():
+        return load_settings().get("recent_projects", [])
+
+    def _save_project_to_history(title, artist, gp_path, psarc_path, art_path):
+        import datetime
+        entry = {
+            "title":         title,
+            "artist":        artist,
+            "gp":            gp_path,
+            "psarc":         psarc_path or "",
+            "art":           art_path or "",
+            "audio":         vars_["audio"].get() or "",
+            "preview_audio": vars_["preview_audio"].get() or "",
+            "out":           vars_["out"].get() or "",
+            "ts":            datetime.datetime.now().strftime("%b %d %Y, %I:%M %p"),
+        }
+        existing = _get_recent_projects()
+        # remove duplicates by gp path, keep newest
+        existing = [e for e in existing if e.get("gp") != gp_path]
+        existing.insert(0, entry)
+        save_settings({"recent_projects": existing[:10]})
+
+    def _get_pinned_gps():
+        return load_settings().get("pinned_gps", [])
+
+    def _toggle_pin(gp_path):
+        pinned = load_settings().get("pinned_gps", [])
+        if gp_path in pinned:
+            pinned.remove(gp_path)
+        else:
+            pinned.insert(0, gp_path)
+            pinned = pinned[:10]
+        save_settings({"pinned_gps": pinned})
+        _show_startup_overlay()
+
+    def _show_startup_overlay():
+        """After Effects-style startup overlay: large logo, two-column layout."""
+        for w in startup_overlay.winfo_children():
+            w.destroy()
+        startup_overlay.place(x=0, y=0, relwidth=1, relheight=1)
+        startup_overlay.lift()
+
+        outer = tk.Frame(startup_overlay, bg=COL["surface"])
+        outer.place(relx=0.5, rely=0.5, anchor="center")
+
+        # ── Logo ────────────────────────────────────────────────────
+        logo_row = tk.Frame(outer, bg=COL["surface"])
+        logo_row.pack(pady=(0, 2))
+        tk.Label(logo_row, text="RS", font=("Segoe UI Black", 44),
+                 fg=COL["accent"], bg=COL["surface"]).pack(side="left")
+        tk.Label(logo_row, text=" STUDIO", font=("Segoe UI", 44, "bold"),
+                 fg=COL["fg"], bg=COL["surface"]).pack(side="left")
+        tk.Label(outer, text="Automated CDLC Pipeline",
+                 font=("Segoe UI", 11), fg=COL["muted"],
+                 bg=COL["surface"]).pack(pady=(0, 30))
+
+        # ── Two-column body ─────────────────────────────────────────
+        body = tk.Frame(outer, bg=COL["surface"])
+        body.pack(fill="x")
+
+        # Left – action buttons (natural sizing, no pack_propagate)
+        left_col = tk.Frame(body, bg=COL["surface"])
+        left_col.pack(side="left", anchor="n", padx=(0, 0))
+
+        def _new_project():
+            startup_overlay.place_forget()
+
+        def _open_existing():
+            gp = filedialog.askopenfilename(
+                title="Open GP File",
+                filetypes=[("Guitar Pro", "*.gp *.gp5 *.gp4 *.gp3 *.gpx"),
+                           ("All files", "*.*")])
+            if not gp:
+                return
+            startup_overlay.place_forget()
+            root.after(50, lambda: load_gp(gp))
+
+        _bkw = dict(font=("Segoe UI Semibold", 11), cursor="hand2",
+                    relief="flat", bd=0, pady=13)
+        tk.Button(left_col, text="＋  Start New Project",
+                  fg="white", bg=COL["accent"],
+                  activebackground=COL["accent_hi"],
+                  command=_new_project, **_bkw).pack(fill="x", pady=(0, 10), ipadx=26)
+        tk.Button(left_col, text="📂  Open Existing Project",
+                  fg=COL["fg"], bg=COL["card2"],
+                  activebackground=COL["border_hi"],
+                  command=_open_existing, **_bkw).pack(fill="x", ipadx=26)
+
+        # Divider
+        tk.Frame(body, width=1, bg=COL["border"]).pack(
+            side="left", fill="y", padx=28)
+
+        # Right – pinned + recent (natural sizing, no pack_propagate)
+        right_col = tk.Frame(body, bg=COL["surface"])
+        right_col.pack(side="left", anchor="n", fill="x", expand=True)
+
+        pinned_gps     = _get_pinned_gps()
+        all_recent     = _get_recent_projects()
+        pinned_entries = [e for e in all_recent
+                          if e.get("gp","") in pinned_gps][:5]
+        recent_entries = [e for e in all_recent
+                          if e.get("gp","") not in pinned_gps][:5]
+
+        def _make_project_row(parent, entry, is_pinned):
+            gp     = entry.get("gp","")
+            title  = (entry.get("title","Unknown") or "Unknown")[:32]
+            artist = (entry.get("artist","") or "")[:28]
+            ts     = entry.get("ts","")
+            psarc  = entry.get("psarc","")
+            has_p  = bool(psarc and os.path.exists(psarc))
+
+            row = tk.Frame(parent, bg=COL["surface"], cursor="hand2")
+            row.pack(fill="x", pady=2)
+
+            # Pin toggle
+            pin_lbl = tk.Label(
+                row,
+                text="📌" if is_pinned else "·",
+                font=("Segoe UI", 14 if is_pinned else 20),
+                fg=COL["accent"] if is_pinned else COL["dim"],
+                bg=COL["surface"], cursor="hand2", width=2, anchor="center")
+            pin_lbl.pack(side="left", padx=(0, 8))
+
+            # Text info
+            info = tk.Frame(row, bg=COL["surface"])
+            info.pack(side="left", fill="x", expand=True)
+
+            name_str = title + (f"  —  {artist}" if artist else "")
+            name_lbl = tk.Label(info, text=name_str,
+                                font=("Segoe UI Semibold", 10),
+                                fg=COL["fg"], bg=COL["surface"], anchor="w")
+            name_lbl.pack(fill="x")
+
+            meta_str = ts + ("  ✓ PSARC" if has_p else "")
+            tk.Label(info, text=meta_str, font=("Segoe UI", 8),
+                     fg=COL["dim"], bg=COL["surface"], anchor="w").pack(fill="x")
+
+            # Open-in-Explorer icon (if psarc exists)
+            if has_p:
+                def _open_p(e=None, p=psarc):
+                    try: subprocess.Popen(["explorer", "/select,",
+                                          os.path.abspath(p)])
+                    except Exception: pass
+                ob = tk.Label(row, text="📂", font=("Segoe UI", 11),
+                              fg=COL["muted"], bg=COL["surface"],
+                              cursor="hand2")
+                ob.pack(side="right", padx=(4, 0))
+                ob.bind("<Button-1>", _open_p)
+
+            # Click → load project (restore all saved paths so auto-fetch is skipped)
+            def _load(e=None, g=gp,
+                      a=entry.get("art",""),
+                      aud=entry.get("audio",""),
+                      prev=entry.get("preview_audio",""),
+                      out=entry.get("out","")):
+                if not g or not os.path.exists(g):
+                    return messagebox.showwarning("File not found",
+                        f"GP file not found:\n{g}")
+                startup_overlay.place_forget()
+                # Restore previously saved file paths before load_gp runs
+                if a    and os.path.exists(a):    vars_["art"].set(a)
+                if aud  and os.path.exists(aud):
+                    vars_["audio"].set(aud)
+                else:
+                    # Fallback: scan GP folder and out folder for audio file
+                    _search_dirs = [os.path.dirname(g)]
+                    if out and os.path.isdir(out): _search_dirs.append(out)
+                    for _sd in _search_dirs:
+                        for _ext in (".ogg", ".wav", ".mp3", ".flac"):
+                            _cands = [f for f in os.listdir(_sd) if f.lower().endswith(_ext)]
+                            if _cands:
+                                vars_["audio"].set(os.path.join(_sd, _cands[0]))
+                                break
+                        if vars_["audio"].get(): break
+                if prev and os.path.exists(prev): vars_["preview_audio"].set(prev)
+                if out  and os.path.isdir(out):   vars_["out"].set(out)
+                root.after(50, lambda: load_gp(g))
+
+            for w in (row, info, name_lbl):
+                w.bind("<Button-1>", _load)
+
+            # Pin toggle click
+            def _pin_tog(e=None, g=gp):
+                _toggle_pin(g)
+            pin_lbl.bind("<Button-1>", _pin_tog)
+
+            # Hover highlight
+            all_w = [row, info, name_lbl]
+            def _henter(e, ws=all_w):
+                for w in ws: w.configure(bg=COL["card"])
+            def _hleave(e, ws=all_w):
+                for w in ws: w.configure(bg=COL["surface"])
+            for w in all_w:
+                w.bind("<Enter>", _henter); w.bind("<Leave>", _hleave)
+
+        if pinned_entries:
+            tk.Label(right_col, text="PINNED",
+                     font=("Segoe UI Semibold", 8),
+                     fg=COL["accent"], bg=COL["surface"],
+                     anchor="w").pack(fill="x", pady=(0, 4))
+            for e in pinned_entries:
+                _make_project_row(right_col, e, is_pinned=True)
+            if recent_entries:
+                tk.Frame(right_col, height=1,
+                         bg=COL["border"]).pack(fill="x", pady=10)
+
+        if recent_entries:
+            lbl = "RECENT" if pinned_entries else "RECENT PROJECTS"
+            tk.Label(right_col, text=lbl,
+                     font=("Segoe UI Semibold", 8),
+                     fg=COL["dim"], bg=COL["surface"],
+                     anchor="w").pack(fill="x", pady=(0, 4))
+            for e in recent_entries:
+                _make_project_row(right_col, e, is_pinned=False)
+
+        if not pinned_entries and not recent_entries:
+            tk.Label(right_col,
+                     text="No recent projects yet.\nLoad a .gp file to get started.",
+                     font=("Segoe UI", 10), fg=COL["dim"],
+                     bg=COL["surface"], justify="left").pack(anchor="w")
 
     mw = tk.Frame(main_page, bg=COL["surface"]); mw.pack(fill="both", expand=True)
     canvas = styled(tk.Canvas(mw, highlightthickness=0, bd=0), bg="surface")
@@ -1174,13 +1470,39 @@ def run_gui():
     fetch_btn = tk.Button(url_row, text="⚡ Auto-Fetch Media", fg="white", relief="flat", bd=0, font=("Segoe UI Semibold", 9), cursor="hand2", padx=10, pady=4, command=lambda: ensure_dependencies_then_run(_show_media_inspector))
     styled(fetch_btn, bg="accent", activebackground="accent_hi"); fetch_btn.pack(side="right", padx=(8, 0))
 
-    col_label(files_left, "OUTPUT FOLDER", 4, 0); col_label(files_left, "AUDIO FILE (.wav / .mp3 / .ogg)", 4, 1, padx=(16, 0))
+    col_label(files_left, "PROJECT FOLDER  (xml, wav, etc.)", 4, 0); col_label(files_left, "AUDIO FILE (.wav / .mp3 / .ogg)", 4, 1, padx=(16, 0))
     file_field(files_left, 5, 0, vars_["out"], [], save_dir=True)
     file_field(files_left, 5, 1, vars_["audio"], [("Audio", "*.wav *.ogg *.mp3 *.flac")], padx=(16, 0))
 
-    col_label(files_left, "ALBUM ART (optional)", 6, 0); col_label(files_left, "LYRICS (.lrc or .txt)", 6, 1, padx=(16, 0))
-    file_field(files_left, 7, 0, vars_["art"], [("Images", "*.png *.jpg *.jpeg")])
-    file_field(files_left, 7, 1, vars_["lyrics"], [("Lyrics", "*.txt *.lrc")], padx=(16, 0))
+    col_label(files_left, "PSARC OUTPUT FOLDER  (where finished .psarc files land — your Rocksmith DLC folder)", 6, 0)
+    psarc_out_row = styled(tk.Frame(files_left), bg="card"); psarc_out_row.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    ef_po = styled(tk.Frame(psarc_out_row, highlightthickness=1), bg="field", highlightbackground="border")
+    ef_po.pack(side="left", fill="x", expand=True, ipady=1)
+    e_po = styled(tk.Entry(ef_po, textvariable=vars_["psarc_out"], relief="flat", font=("Segoe UI", 10), bd=4, highlightthickness=0), bg="field", fg="fg", insertbackground="accent_hi")
+    e_po.pack(fill="x", expand=True)
+    e_po.bind("<FocusIn>", lambda ev: ef_po.config(highlightbackground=COL["accent"]))
+    e_po.bind("<FocusOut>", lambda ev: ef_po.config(highlightbackground=COL["border"]))
+    def _browse_psarc_out():
+        p = filedialog.askdirectory(title="Select PSARC output / Rocksmith DLC folder")
+        if p: vars_["psarc_out"].set(p)
+    def _open_psarc_out():
+        p = vars_["psarc_out"].get().strip()
+        if p and os.path.isdir(p):
+            subprocess.Popen(["explorer", p] if sys.platform == "win32" else ["xdg-open", p])
+    tk.Button(psarc_out_row, text="⋯", font=("Segoe UI", 9), cursor="hand2",
+              command=_browse_psarc_out, relief="flat", bd=0, padx=8, pady=4,
+              bg=COL["card2"], fg=COL["fg"], activebackground=COL["border_hi"]).pack(side="left", padx=(4, 2))
+    tk.Button(psarc_out_row, text="📂 Open Builds", font=("Segoe UI", 8), cursor="hand2",
+              command=_open_psarc_out, relief="flat", bd=0, padx=10, pady=4,
+              bg=COL["card2"], fg=COL["accent"], activebackground=COL["border_hi"]).pack(side="left", padx=(0, 2))
+    styled(tk.Label(psarc_out_row,
+                    text="Tip: set this to your Rocksmith\\dlc folder — finished PSARCs drop here automatically",
+                    font=("Segoe UI", 7)),
+           fg="dim", bg="card").pack(side="left", padx=(6, 0))
+
+    col_label(files_left, "ALBUM ART (optional)", 8, 0); col_label(files_left, "LYRICS (.lrc or .txt)", 8, 1, padx=(16, 0))
+    file_field(files_left, 9, 0, vars_["art"], [("Images", "*.png *.jpg *.jpeg")])
+    file_field(files_left, 9, 1, vars_["lyrics"], [("Lyrics", "*.txt *.lrc")], padx=(16, 0))
 
     # Video preview panel (top-right)
     main_vid_container = styled(tk.Frame(files_right, highlightthickness=1, width=320, height=180), bg="field", highlightbackground="border")
@@ -1321,11 +1643,11 @@ def run_gui():
         ttk.Button(ef, text="⋯", command=browse(vars_[vk], [] if sd else [("packer.exe", "packer.exe"), ("All", "*.*")], save_dir=sd), style="Inline.TButton").pack(side="right", padx=2)
 
     # ══════════════════════════════════════════════════════════════════════
-    # PAGE: SYNC TUNER
+    # PAGE: AUDIO EDITOR (formerly Slopsmith)
     # ══════════════════════════════════════════════════════════════════════
     slop_page = styled(tk.Frame(page_container), bg="surface")
-    pages["slopsmith"] = slop_page
-    page_header(slop_page, "Sync Tuner")
+    pages["audioeditor"] = slop_page
+    page_header(slop_page, "Audio Editor  —  Sync Tuner")
 
     # ── waveform state ────────────────────────────────────────────────────
     _wf_state = {
@@ -1667,7 +1989,7 @@ def run_gui():
         _wf_stop()
         offset = _wf_state["play_offset"]
         proc = subprocess.Popen(
-            [ffplay, "-nodisp", "-autoexit", "-ss", str(offset), "-volume", "80", path],
+            [ffplay, "-nodisp", "-autoexit", "-ss", str(offset), "-volume", str(_player_vol[0]), path],
             creationflags=CREATE_NO_WINDOW)
         _wf_state.update(proc=proc, playing=True, wall_start=time.time())
         try: btn_wf_play.configure(text="⏸ Pause")
@@ -1852,10 +2174,51 @@ def run_gui():
         lambda e: (bpm_ef.config(highlightbackground=COL["border"]), _wf_redraw()))
 
     styled(tk.Label(bpm_ctrl_row, text="BPM", font=("Segoe UI", 8)),
-           fg="dim", bg="surface").pack(side="left", padx=(2, 16))
+           fg="dim", bg="surface").pack(side="left", padx=(2, 12))
+
+    # Auto BPM: derive effective audio BPM from GP total duration vs audio duration
+    _auto_bpm_status = tk.StringVar(value="")
+
+    def _auto_bpm():
+        gp_path    = vars_["gp"].get().strip()
+        audio_path = vars_["audio"].get().strip()
+        if not gp_path or not os.path.exists(gp_path):
+            _auto_bpm_status.set("Load a GP file first")
+            return
+        audio_dur = _wf_state.get("duration", 0) or _get_dur(audio_path)
+        if audio_dur <= 0:
+            _auto_bpm_status.set("Load waveform first")
+            return
+        _auto_bpm_status.set("Computing…")
+        def _worker():
+            gp_dur = extract_gp_total_seconds(gp_path)
+            if not gp_dur or gp_dur <= 0:
+                root.after(0, lambda: _auto_bpm_status.set("Couldn't read GP duration"))
+                return
+            try:
+                base_bpm = float(vars_["bpm"].get() or 120)
+            except ValueError:
+                base_bpm = 120.0
+            effective_bpm = round(base_bpm * (gp_dur / audio_dur), 3)
+            effective_bpm = max(20.0, min(400.0, effective_bpm))
+            txt = f"{effective_bpm:.3f}".rstrip("0").rstrip(".")
+            root.after(0, lambda: vars_["bpm"].set(txt))
+            root.after(0, _wf_redraw)
+            root.after(0, lambda: _auto_bpm_status.set(
+                f"→ {txt} BPM  (GP {gp_dur:.1f}s / audio {audio_dur:.1f}s)"))
+            log(f"  [auto-bpm] GP={gp_dur:.3f}s  audio={audio_dur:.3f}s  → {txt} BPM")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    tk.Button(bpm_ctrl_row, text="Auto ↺", font=("Segoe UI", 8), cursor="hand2",
+              command=_auto_bpm, relief="flat", bd=0, padx=10, pady=4,
+              bg=COL["card2"], fg=COL["accent"],
+              activebackground=COL["border_hi"]).pack(side="left", padx=(0, 6))
+
+    styled(tk.Label(bpm_ctrl_row, textvariable=_auto_bpm_status, font=("Segoe UI", 7)),
+           fg="dim", bg="surface").pack(side="left")
 
     styled(tk.Label(bpm_ctrl_row,
-                    text="Grid = bars  |  zoom ≤ 8s shows beats",
+                    text="   Grid = bars  |  zoom ≤ 8s shows beats",
                     font=("Segoe UI", 7)),
            fg="dim", bg="surface").pack(side="left")
 
@@ -1959,7 +2322,11 @@ def run_gui():
                 tempo_events, tpb = extract_gp_tempo_map(gp_path)
                 sec_events = tempo_map_to_seconds(tempo_events, tpb)
                 dur = _wf_state["duration"] or _get_dur(audio_path)
-                stretch_audio_to_gp(audio_path, out_path, sec_events, dur, log)
+                gp_dur = extract_gp_total_seconds(gp_path)
+                if gp_dur:
+                    log(f"  [stretch] GP total duration: {gp_dur:.3f}s  Audio: {dur:.3f}s")
+                stretch_audio_to_gp(audio_path, out_path, sec_events, dur,
+                                    gp_expected_duration=gp_dur, log=log)
                 # Load the stretched file as the new audio and reload waveform
                 root.after(0, lambda: vars_["audio"].set(out_path))
                 root.after(100, _load_waveform)
@@ -2019,12 +2386,68 @@ def run_gui():
            fg="dim", bg="card").pack(anchor="w", padx=10, pady=(0,6))
 
     btn_rebuild = tk.Button(rebuild_frame,
-                            text="▶  Rebuild CDLC with current Lead-In",
+                            text="▶  Build CDLC",
                             font=("Segoe UI Semibold", 11), cursor="hand2",
                             command=lambda: do_build(),
                             relief="flat", bd=0, padx=22, pady=12, fg="white")
     styled(btn_rebuild, bg="accent", activebackground="accent_hi")
     btn_rebuild.pack(side="left", anchor="center")
+
+    # ── SLOPSMITH QUICK-LAUNCH (always visible) ───────────────────────────
+    slop_quick_row = styled(tk.Frame(sync_body), bg="surface")
+    slop_quick_row.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+    styled(tk.Label(slop_quick_row, text="Verify in Slopsmith:",
+                    font=("Segoe UI", 8)),
+           fg="muted", bg="surface").pack(side="left", padx=(0, 8))
+
+    _slop_quick_status = tk.StringVar(value="")
+
+    def _quick_launch_slop():
+        exe = vars_["slop_exe"].get().strip()
+        if exe and os.path.isfile(exe):
+            try:
+                subprocess.Popen([exe], creationflags=CREATE_NO_WINDOW)
+                _slop_quick_status.set("✓ Launched Slopsmith Desktop")
+                log(f"  [slopsmith] Launched: {exe}")
+            except Exception as ex:
+                _slop_quick_status.set(f"✗ {ex}")
+        else:
+            # Try auto-finding
+            found = _find_slopsmith_exe()
+            if found:
+                vars_["slop_exe"].set(found)
+                try:
+                    subprocess.Popen([found], creationflags=CREATE_NO_WINDOW)
+                    _slop_quick_status.set("✓ Launched Slopsmith Desktop")
+                    log(f"  [slopsmith] Auto-found & launched: {found}")
+                except Exception as ex:
+                    _slop_quick_status.set(f"✗ {ex}")
+            else:
+                _slop_quick_status.set("Slopsmith not found — browse in settings below")
+
+    def _quick_open_slop_browser():
+        import webbrowser
+        url = vars_["slop_url"].get().strip() or "http://localhost:8000"
+        webbrowser.open(url)
+        _slop_quick_status.set(f"Opened {url} in browser")
+
+    tk.Button(slop_quick_row, text="▶  Launch Desktop App",
+              font=("Segoe UI Semibold", 9), cursor="hand2",
+              command=_quick_launch_slop, relief="flat", bd=0,
+              padx=14, pady=6, fg="white",
+              bg=COL["ok"], activebackground=COL["ok"]).pack(side="left", padx=(0, 6))
+
+    tk.Button(slop_quick_row, text="Open in Browser ↗",
+              font=("Segoe UI", 9), cursor="hand2",
+              command=_quick_open_slop_browser, relief="flat", bd=0,
+              padx=12, pady=6,
+              bg=COL["card2"], fg=COL["accent"],
+              activebackground=COL["border_hi"]).pack(side="left", padx=(0, 10))
+
+    styled(tk.Label(slop_quick_row, textvariable=_slop_quick_status,
+                    font=("Segoe UI", 8)),
+           fg="dim", bg="surface").pack(side="left")
 
     # ── SLOPSMITH (collapsed by default) ─────────────────────────────────
     slop_collapsed = [True]
@@ -2033,7 +2456,7 @@ def run_gui():
     # FIX: define function first, then create the button that references it
     def _toggle_slop_detail():
         if slop_collapsed[0]:
-            slop_detail.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4,0))
+            slop_detail.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(4,0))
             btn_slop_toggle.configure(text="▲ Slopsmith (advanced)")
             slop_collapsed[0] = False
         else:
@@ -2047,7 +2470,7 @@ def run_gui():
                                 command=_toggle_slop_detail,
                                 relief="flat", bd=0, padx=0, pady=4)
     styled(btn_slop_toggle, bg="surface", fg="dim", activebackground="surface")
-    btn_slop_toggle.grid(row=6, column=0, columnspan=2, sticky="w", pady=(10,0))
+    btn_slop_toggle.grid(row=7, column=0, columnspan=2, sticky="w", pady=(6,0))
 
     # Slopsmith detail content (hidden by default)
     slop_status_var = tk.StringVar(value="")
@@ -2156,6 +2579,198 @@ def run_gui():
     styled(tk.Label(slop_url_row, textvariable=slop_status_var, font=("Segoe UI", 8)),
            fg="ok", bg="card").pack(side="left", padx=(10,0))
 
+    # ══════════════════════════════════════════════════════════════════════
+    # PAGE: SLOPSMITH GAMEPLAY EMBED
+    # ══════════════════════════════════════════════════════════════════════
+    slop_embed_page = styled(tk.Frame(page_container), bg="surface")
+    pages["slopsmith"] = slop_embed_page
+    page_header(slop_embed_page, "Slopsmith  —  Verify & Test")
+
+    _slop_embed_state = {"hwnd": 0, "pid": 0}
+
+    slop_embed_body = styled(tk.Frame(slop_embed_page), bg="surface")
+    slop_embed_body.pack(fill="both", expand=True, padx=28, pady=(12, 16))
+
+    # ── toolbar ──────────────────────────────────────────────────────────
+    slop_tb = styled(tk.Frame(slop_embed_body), bg="surface")
+    slop_tb.pack(fill="x", pady=(0, 8))
+
+    _slop_embed_status = tk.StringVar(value="Slopsmith not running — click Launch to start.")
+
+    def _slop_embed_launch():
+        exe = vars_["slop_exe"].get().strip()
+        if not exe or not os.path.isfile(exe):
+            exe = _find_slopsmith_exe()
+            if exe:
+                vars_["slop_exe"].set(exe)
+            else:
+                _slop_embed_status.set("Slopsmith not found — set path in Audio Editor → Slopsmith (advanced).")
+                return
+        _slop_embed_status.set("Launching Slopsmith…")
+        try:
+            proc = subprocess.Popen([exe])
+            _slop_embed_state["pid"] = proc.pid
+            # Give Electron extra time to fully render before we try to embed
+            root.after(4000, _slop_try_embed)
+        except Exception as ex:
+            _slop_embed_status.set(f"Launch failed: {ex}")
+
+    def _slop_try_embed():
+        """Find the Slopsmith window and embed it into our canvas."""
+        import ctypes
+        pid = _slop_embed_state["pid"]
+        hwnd = [0]
+
+        def _enum_cb(h, _):
+            if not ctypes.windll.user32.IsWindowVisible(h):
+                return True
+            buf = ctypes.create_unicode_buffer(512)
+            ctypes.windll.user32.GetWindowTextW(h, buf, 512)
+            title = buf.value
+            title_lo = title.lower()
+            # Match by pid first (most reliable), then by title keyword
+            h_pid = _get_hwnd_pid(h)
+            if pid and h_pid == pid:
+                hwnd[0] = h
+                return False
+            if "slopsmith" in title_lo:
+                hwnd[0] = h
+                return False
+            return True
+
+        def _get_hwnd_pid(h):
+            pid_buf = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(h, ctypes.byref(pid_buf))
+            return pid_buf.value
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+        ctypes.windll.user32.EnumWindows(EnumWindowsProc(_enum_cb), 0)
+
+        if not hwnd[0]:
+            # Try again in 1s — Slopsmith might still be loading
+            if _slop_embed_state.get("_embed_retries", 0) < 20:
+                _slop_embed_state["_embed_retries"] = _slop_embed_state.get("_embed_retries", 0) + 1
+                _slop_embed_status.set(f"Waiting for Slopsmith window… ({_slop_embed_state['_embed_retries']}/20)")
+                root.after(1500, _slop_try_embed)
+            else:
+                _slop_embed_status.set("Couldn't embed — Slopsmith may already be open. Click Re-embed.")
+            return
+
+        _slop_embed_state["_embed_retries"] = 0
+        _slop_embed_state["hwnd"] = hwnd[0]
+        h = hwnd[0]
+        parent_hwnd = slop_embed_canvas.winfo_id()
+
+        GWL_STYLE   = -16
+        WS_CHILD    = 0x40000000
+        WS_VISIBLE  = 0x10000000
+
+        # Remove title bar, set as child
+        ctypes.windll.user32.SetParent(h, parent_hwnd)
+        ctypes.windll.user32.SetWindowLongW(h, GWL_STYLE, WS_CHILD | WS_VISIBLE)
+
+        # Resize to fill canvas
+        w = slop_embed_canvas.winfo_width() or 1200
+        hh = slop_embed_canvas.winfo_height() or 700
+        ctypes.windll.user32.MoveWindow(h, 0, 0, w, hh, True)
+
+        _slop_embed_status.set("✓ Slopsmith embedded — play to verify beat sync.")
+        root.after(0, lambda: btn_slop_detach.configure(state="normal"))
+        root.after(0, lambda: btn_slop_embed.configure(text="↺ Re-embed", state="normal"))
+
+        # Electron tends to escape SetParent — run a keeper loop every 2s
+        _slop_embed_state["_keep_alive"] = True
+        _slop_keep_embedded()
+
+    def _slop_keep_embedded():
+        """Periodically re-assert SetParent so Electron can't escape the canvas."""
+        if not _slop_embed_state.get("_keep_alive"):
+            return
+        h = _slop_embed_state.get("hwnd", 0)
+        if not h:
+            return
+        import ctypes
+        try:
+            parent_hwnd = slop_embed_canvas.winfo_id()
+            cur_parent = ctypes.windll.user32.GetParent(h)
+            if cur_parent != parent_hwnd:
+                GWL_STYLE = -16
+                WS_CHILD  = 0x40000000
+                WS_VISIBLE = 0x10000000
+                ctypes.windll.user32.SetParent(h, parent_hwnd)
+                ctypes.windll.user32.SetWindowLongW(h, GWL_STYLE, WS_CHILD | WS_VISIBLE)
+                w = slop_embed_canvas.winfo_width() or 1200
+                hh = slop_embed_canvas.winfo_height() or 700
+                ctypes.windll.user32.MoveWindow(h, 0, 0, w, hh, True)
+        except Exception:
+            pass
+        root.after(2000, _slop_keep_embedded)
+
+    def _slop_on_resize(event):
+        h = _slop_embed_state.get("hwnd", 0)
+        if h:
+            import ctypes
+            try:
+                ctypes.windll.user32.MoveWindow(h, 0, 0, event.width, event.height, True)
+            except Exception:
+                pass
+
+    def _slop_detach():
+        """Release Slopsmith back to its own window."""
+        import ctypes
+        _slop_embed_state["_keep_alive"] = False  # stop keeper loop
+        h = _slop_embed_state.get("hwnd", 0)
+        if h:
+            GWL_STYLE  = -16
+            WS_OVERLAPPEDWINDOW = 0x00CF0000
+            WS_VISIBLE = 0x10000000
+            ctypes.windll.user32.SetParent(h, 0)
+            ctypes.windll.user32.SetWindowLongW(h, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE)
+            ctypes.windll.user32.ShowWindow(h, 9)  # SW_RESTORE
+            _slop_embed_state["hwnd"] = 0
+            _slop_embed_status.set("Slopsmith detached.")
+            btn_slop_detach.configure(state="disabled")
+            btn_slop_embed.configure(text="▶  Launch & Embed Slopsmith", state="normal")
+
+    btn_slop_embed = tk.Button(slop_tb, text="▶  Launch & Embed Slopsmith",
+                               font=("Segoe UI Semibold", 10), cursor="hand2",
+                               command=_slop_embed_launch, relief="flat", bd=0,
+                               padx=18, pady=8, fg="white",
+                               bg=COL["ok"], activebackground=COL["ok"])
+    btn_slop_embed.pack(side="left", padx=(0, 8))
+
+    btn_slop_detach = tk.Button(slop_tb, text="⤢  Detach to Window",
+                                font=("Segoe UI", 9), cursor="hand2",
+                                command=_slop_detach, relief="flat", bd=0,
+                                padx=12, pady=8, state="disabled",
+                                bg=COL["card2"], fg=COL["fg"],
+                                activebackground=COL["border_hi"])
+    btn_slop_detach.pack(side="left", padx=(0, 12))
+
+    styled(tk.Label(slop_tb, textvariable=_slop_embed_status, font=("Segoe UI", 8)),
+           fg="dim", bg="surface").pack(side="left")
+
+    # ── embed canvas ──────────────────────────────────────────────────────
+    slop_embed_canvas = styled(tk.Frame(slop_embed_body, bg="black",
+                                        highlightthickness=1, highlightbackground=COL["border"]),
+                               bg="surface")
+    slop_embed_canvas.pack(fill="both", expand=True)
+    slop_embed_canvas.bind("<Configure>", _slop_on_resize)
+
+    # Placeholder text shown before Slopsmith is embedded
+    _slop_placeholder = styled(tk.Label(slop_embed_canvas,
+                                         text="▶  Launch & Embed Slopsmith to see the 3D highway here",
+                                         font=("Segoe UI", 13)), fg="muted", bg="black")
+    _slop_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+
+    # Auto-hide placeholder when embed is active
+    def _slop_page_shown():
+        if _slop_embed_state.get("hwnd", 0):
+            _slop_placeholder.place_forget()
+        else:
+            _slop_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+    slop_embed_page.bind("<Visibility>", lambda e: root.after(100, _slop_page_shown))
+
     # PAGE: LOG
     # ══════════════════════════════════════════════════════════════════════
     log_page = styled(tk.Frame(page_container), bg="surface"); pages["log"] = log_page
@@ -2167,6 +2782,126 @@ def run_gui():
     def log(msg):
         log_text.configure(state="normal"); log_text.insert("end", str(msg) + "\n"); log_text.see("end"); log_text.configure(state="disabled")
         root.update_idletasks()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # PAGE: HELP
+    # ══════════════════════════════════════════════════════════════════════
+    help_page = styled(tk.Frame(page_container), bg="surface"); pages["help"] = help_page
+    page_header(help_page, "How to Use RS Studio")
+
+    help_scroll_outer = styled(tk.Frame(help_page), bg="surface")
+    help_scroll_outer.pack(fill="both", expand=True)
+    help_canvas = tk.Canvas(help_scroll_outer, highlightthickness=0, bd=0, bg=COL["surface"])
+    help_vsb = ttk.Scrollbar(help_scroll_outer, orient="vertical", command=help_canvas.yview)
+    help_canvas.configure(yscrollcommand=help_vsb.set)
+    help_canvas.pack(side="left", fill="both", expand=True)
+    help_vsb.pack(side="right", fill="y")
+    help_inner = styled(tk.Frame(help_canvas), bg="surface")
+    help_win = help_canvas.create_window((0, 0), window=help_inner, anchor="nw")
+    help_inner.bind("<Configure>", lambda e: help_canvas.configure(
+        scrollregion=(0, 0, e.width, e.height)))
+    help_canvas.bind("<Configure>", lambda e: help_canvas.itemconfig(help_win, width=e.width))
+    help_canvas.bind_all("<MouseWheel>", lambda e: help_canvas.yview_scroll(
+        int(-1*(e.delta/120)), "units"))
+
+    def _help_section(title, body_lines):
+        sec = styled(tk.Frame(help_inner), bg="surface")
+        sec.pack(fill="x", padx=48, pady=(0, 24))
+        styled(tk.Label(sec, text=title, font=("Segoe UI Black", 13), anchor="w"),
+               fg="accent", bg="surface").pack(fill="x", pady=(0, 6))
+        styled(tk.Frame(sec, height=1), bg="border").pack(fill="x", pady=(0, 10))
+        for line in body_lines:
+            if line.startswith("•"):
+                row = styled(tk.Frame(sec), bg="surface")
+                row.pack(fill="x", pady=1)
+                styled(tk.Label(row, text="•", font=("Segoe UI", 10), width=2, anchor="nw"),
+                       fg="accent", bg="surface").pack(side="left", anchor="nw")
+                styled(tk.Label(row, text=line[1:].strip(), font=("Segoe UI", 10),
+                                wraplength=700, justify="left", anchor="nw"),
+                       fg="fg", bg="surface").pack(side="left", fill="x", expand=True)
+            elif line == "":
+                tk.Frame(sec, height=6, bg=COL["surface"]).pack()
+            else:
+                styled(tk.Label(sec, text=line, font=("Segoe UI", 10),
+                                wraplength=720, justify="left", anchor="w"),
+                       fg="fg", bg="surface").pack(fill="x", pady=1)
+
+    tk.Frame(help_inner, height=20, bg=COL["surface"]).pack()
+
+    _help_section("Step 1 — Load a Guitar Pro File", [
+        "RS Studio starts with a Guitar Pro (.gp / .gp5) file that contains your song's notes and tempo map.",
+        "",
+        "• Click  ＋ Start New Project  on the splash screen to get to the Main page.",
+        "• Drag and drop a .gp file onto the GP File field, or click Browse to find it.",
+        "• RS Studio will automatically read the title, artist, and BPM from the file.",
+    ])
+
+    _help_section("Step 2 — Auto-Fetch Audio & Artwork", [
+        "You need an audio file (.ogg or .wav) and album art (.png / .jpg) to build a CDLC.",
+        "",
+        "• Click  Auto-Fetch  next to the Audio URL field. RS Studio will search YouTube for the song and download audio automatically using yt-dlp.",
+        "• If the wrong song is found, paste a direct YouTube URL into the Audio URL box first.",
+        "• Album art is fetched from MusicBrainz / Cover Art Archive automatically. You can also drag your own image onto the Art field.",
+        "• The bottom player bar shows the loaded song — press  ▶  to preview the audio.",
+    ])
+
+    _help_section("Step 3 — Review Settings (Main Page)", [
+        "Before building, check these key settings:",
+        "",
+        "• Title / Artist / Album / Year — filled automatically from the .gp file. Edit if needed.",
+        "• Lead-in (seconds) — silent gap before notes start. Default 5s is fine for most songs.",
+        "• Volume — negative dB value. Default -8 dB. Lower = quieter in-game.",
+        "• Scroll Speed — how fast the note highway scrolls. Higher = faster. Tune in the Audio Editor.",
+        "• Output Folder — where the project files are saved. Defaults to RS Studio Projects/ next to the app.",
+        "• PSARC Output — optional: where the final .psarc file is copied after building.",
+    ])
+
+    _help_section("Step 4 — Tune Timing (Audio Editor)", [
+        "If the notes feel early or late when you play, use the Audio Editor to fix sync.",
+        "",
+        "• The Sync Tuner shows BPM and a stretch slider. The GP file's tempo map drives note timing.",
+        "• Use  Auto BPM  to detect BPM from the audio file if it differs from the GP file.",
+        "• Stretch Audio to GP Length adjusts audio speed so it matches the note map exactly.",
+        "• Click  ▶ Launch Desktop App  to open Slopsmith in your browser for a quick visual check.",
+    ])
+
+    _help_section("Step 5 — Build the CDLC", [
+        "Click  ▶ Create CDLC  in the bottom-left of the sidebar.",
+        "",
+        "• RS Studio runs the full build pipeline: converts audio, generates .xml chart data, packages everything into a .psarc file.",
+        "• Progress is logged on the Log page (≡ in the sidebar).",
+        "• When done, a dialog shows the output path and Windows Explorer opens to the file.",
+        "• The built project also appears in the splash screen's Recent Projects list next time.",
+    ])
+
+    _help_section("Step 6 — Verify in Slopsmith", [
+        "Slopsmith is a Rocksmith-compatible gameplay engine you can use to see and hear your CDLC before loading it in the actual game. You need to build the CDLC (Step 5) first — Slopsmith reads the .psarc file.",
+        "",
+        "• Go to the  Slopsmith  tab in the sidebar.",
+        "• Click  ▶ Launch & Embed Slopsmith — the app launches and embeds inside RS Studio after a few seconds.",
+        "• In Slopsmith, open your .psarc file from the library.",
+        "• Start a session and watch the 3D note highway. If notes are mis-timed, go back to the Audio Editor and adjust.",
+        "• Click  ⤢ Detach to Window  to pop Slopsmith back out as its own window if needed.",
+    ])
+
+    _help_section("Step 7 — Install in Rocksmith", [
+        "Once you're happy with the CDLC, copy the .psarc file into your Rocksmith DLC folder.",
+        "",
+        "• Default Rocksmith DLC path:  Steam\\steamapps\\common\\Rocksmith2014\\dlc\\",
+        "• Launch Rocksmith 2014 Remastered — the song appears in Learn a Song.",
+        "• If it doesn't show up, check that your game has the D3DX9 fix / CDLC enabler installed.",
+    ])
+
+    _help_section("Tips & Troubleshooting", [
+        "• No audio after auto-fetch? Make sure yt-dlp.exe and ffmpeg.exe are in the same folder as the app.",
+        "• Build failed? Check the Log page for the exact error. Common causes: missing packer.exe path, bad audio format, or GP file with unsupported features.",
+        "• Slopsmith won't embed? Give it 10–20 seconds after clicking Launch. Click  ↺ Re-embed  if needed.",
+        "• Wrong song fetched from YouTube? Paste a direct YouTube link into Audio URL before clicking Auto-Fetch.",
+        "• Volume too loud in-game? Lower the Volume field (e.g. -12 instead of -8) and rebuild.",
+        "• Change theme colors anytime via the  ◐ Theme  tab — your accent color is saved.",
+    ])
+
+    tk.Frame(help_inner, height=40, bg=COL["surface"]).pack()
 
     # ══════════════════════════════════════════════════════════════════════
     # PAGE: THEME
@@ -2264,11 +2999,12 @@ def run_gui():
         backdrop.transient(root)
         backdrop.lift()
 
-        # Main modal dialog
+        # Main modal dialog — frameless like the tools-download popup
         modal = tk.Toplevel(root)
         modal.transient(root)
-        modal.configure(bg=COL["card"])
-        modal.resizable(False, False)
+        modal.overrideredirect(True)
+        modal.configure(bg=COL["card"],
+                        highlightthickness=1, highlightbackground=COL["border_hi"])
         w, h = 840, 480
         x = rx + max(0, (rw - w) // 2)
         y = ry + max(0, (rh - h) // 2)
@@ -2276,8 +3012,6 @@ def run_gui():
         modal.lift()
         modal.focus_set()
         modal.grab_set()
-
-        modal.title("Media Inspector")
         m_head = tk.Frame(modal, bg=COL["card2"]); m_head.pack(fill="x")
         tk.Label(m_head, text="🎬 Media Inspector", font=("Segoe UI Semibold", 13), fg=COL["fg"], bg=COL["card2"]).pack(side="left", padx=24, pady=16)
 
@@ -2296,6 +3030,9 @@ def run_gui():
             try: modal.destroy()
             except Exception: pass
             try: backdrop.destroy()
+            except Exception: pass
+            # With overrideredirect=True, focus doesn't auto-return — force it back
+            try: root.focus_force()
             except Exception: pass
 
         # Escape key closes the inspector
@@ -2512,68 +3249,319 @@ def run_gui():
 
         threading.Thread(target=fetch_info, daemon=True).start()
 
+    # ── AUTOMAGIC DOWNLOAD ────────────────────────────────────────────────
+    def _trigger_automagic(confirmed_url):
+        """Download audio from confirmed_url via yt-dlp, set vars_["audio"] and preview."""
+        out_dir = vars_["out"].get()
+        if not out_dir or not os.path.isdir(out_dir):
+            return messagebox.showerror("Missing Folder", "Please set an Output Folder before downloading.")
+
+        ytdlp  = _find_exe("yt-dlp")
+        ffmpeg = _find_exe("ffmpeg")
+        if not ytdlp:
+            return messagebox.showerror("Missing tool", "yt-dlp not found. Run Auto-Fetch again to re-download it.")
+
+        # ── Progress overlay ──
+        root.update_idletasks()
+        rx = root.winfo_rootx(); ry = root.winfo_rooty()
+        rw = root.winfo_width();  rh = root.winfo_height()
+        dl_overlay = tk.Toplevel(root)
+        dl_overlay.overrideredirect(True)
+        dl_overlay.geometry(f"{rw}x{rh}+{rx}+{ry}")
+        dl_overlay.configure(bg="#000000")
+        dl_overlay.attributes("-alpha", 0.72)
+        dl_overlay.transient(root); dl_overlay.lift()
+
+        dl_card = tk.Toplevel(root)
+        dl_card.transient(root); dl_card.overrideredirect(True)
+        dl_card.configure(bg=COL["card"], highlightthickness=1, highlightbackground=COL["border_hi"])
+        cw, ch = 400, 130
+        dl_card.geometry(f"{cw}x{ch}+{rx+(rw-cw)//2}+{ry+(rh-ch)//2}")
+        dl_card.lift(); dl_card.grab_set()
+
+        status_var2 = tk.StringVar(value="Starting download…")
+        tk.Label(dl_card, text="⬇  Downloading Audio", font=("Segoe UI Semibold", 12),
+                 bg=COL["card"], fg=COL["fg"]).pack(pady=(20, 6))
+        tk.Label(dl_card, textvariable=status_var2, font=("Segoe UI", 9),
+                 bg=COL["card"], fg=COL["muted"], wraplength=360).pack()
+
+        def _close_overlay():
+            try: dl_card.grab_release()
+            except Exception: pass
+            try: dl_card.destroy()
+            except Exception: pass
+            try: dl_overlay.destroy()
+            except Exception: pass
+            try: root.focus_force()
+            except Exception: pass
+
+        def _dl_worker():
+            try:
+                dest_dir = out_dir
+                out_tmpl = os.path.join(dest_dir, "ytdlp_audio.%(ext)s")
+                # Remove stale ytdlp_audio.* files
+                for f in os.listdir(dest_dir):
+                    if f.startswith("ytdlp_audio"):
+                        try: os.remove(os.path.join(dest_dir, f))
+                        except Exception: pass
+
+                root.after(0, lambda: status_var2.set("Running yt-dlp…"))
+                cmd = [ytdlp, "-x", "--audio-format", "wav",
+                       "--no-playlist", "--no-warnings",
+                       "-o", out_tmpl, confirmed_url]
+                proc = subprocess.run(cmd, capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=300)
+
+                # Find the downloaded file
+                raw_audio = None
+                for f in sorted(os.listdir(dest_dir)):
+                    if f.startswith("ytdlp_audio") and f.endswith(".wav"):
+                        raw_audio = os.path.join(dest_dir, f)
+                        break
+
+                if not raw_audio or not os.path.exists(raw_audio):
+                    raise Exception("yt-dlp finished but no .wav found. Check the URL and try again.")
+
+                root.after(0, lambda: vars_["audio"].set(raw_audio))
+                log(f"  [fetch] Audio saved: {raw_audio}")
+
+                # Generate preview clip
+                if ffmpeg:
+                    root.after(0, lambda: status_var2.set("Generating preview clip…"))
+                    try:
+                        prev_path = os.path.join(dest_dir, "ytdlp_preview.wav")
+                        subprocess.run(
+                            [ffmpeg, "-y", "-i", raw_audio,
+                             "-ss", "60", "-t", "30",
+                             "-acodec", "pcm_s16le", prev_path],
+                            capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=60)
+                        if os.path.exists(prev_path):
+                            root.after(0, lambda: vars_["preview_audio"].set(prev_path))
+                            log(f"  [fetch] Preview saved: {prev_path}")
+                    except Exception as pe:
+                        log(f"  [fetch] Preview generation failed: {pe}")
+
+                root.after(0, lambda: status_var2.set("✓ Done!"))
+                root.after(0, _update_player_ui)
+                root.after(800, _close_overlay)
+                root.after(0, lambda: log("  [fetch] Auto-fetch complete."))
+            except Exception as e:
+                root.after(0, lambda: status_var2.set(f"✗ {e}"))
+                root.after(0, lambda: log(f"  [fetch] Error: {e}"))
+                root.after(3000, _close_overlay)
+
+        threading.Thread(target=_dl_worker, daemon=True).start()
+
     # ══════════════════════════════════════════════════════════════════════
     # SPOTIFY BOTTOM PLAYER BAR
     # ══════════════════════════════════════════════════════════════════════
-    player_bar = styled(tk.Frame(root, height=90), bg="card2")
+    player_bar = styled(tk.Frame(root, height=114), bg="card2")
     player_bar.grid(row=1, column=0, columnspan=2, sticky="ew")
     player_bar.grid_propagate(False)
+
+    # ── Timeline scrubber ──────────────────────────────────────────────────
+    tl_canvas = tk.Canvas(player_bar, height=22, bg=COL["card2"],
+                          highlightthickness=0, cursor="hand2")
+    tl_canvas.place(x=0, y=0, relwidth=1.0, height=22)
+    # thin divider line below scrubber
+    tl_div = tk.Frame(player_bar, height=1, bg=COL["border"])
+    tl_div.place(x=0, y=22, relwidth=1.0, height=1)
+
+    _tl = {"dur": 0.0, "t0": None, "offset": 0.0, "kind": None, "after_id": None}
+
+    def _tl_get_duration(path):
+        ffmpeg = _find_exe("ffmpeg")
+        if not ffmpeg: return 0.0
+        try:
+            r = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True,
+                               timeout=10, creationflags=CREATE_NO_WINDOW)
+            m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", r.stderr)
+            if m:
+                h, mi, s = m.groups()
+                return int(h)*3600 + int(mi)*60 + float(s)
+        except Exception: pass
+        return 0.0
+
+    def _tl_fmt(secs):
+        secs = max(0, int(secs))
+        return f"{secs//60}:{secs%60:02d}"
+
+    def _tl_draw():
+        w = tl_canvas.winfo_width() or 1
+        tl_canvas.delete("all")
+        PAD = 52  # pixel room for time labels on each side
+        dur = _tl["dur"]
+        elapsed = 0.0
+        if dur > 0 and _tl["t0"] is not None:
+            elapsed = min(time.time() - _tl["t0"] + _tl["offset"], dur)
+        # Track background (lighter than card2 so it's visible)
+        tl_canvas.create_rectangle(PAD, 8, w - PAD, 14,
+                                   fill=COL["border_hi"], outline="", tags="track")
+        if dur > 0:
+            frac = elapsed / dur
+            fill_x = PAD + frac * (w - PAD * 2)
+            # Progress fill
+            tl_canvas.create_rectangle(PAD, 8, fill_x, 14,
+                                       fill=COL["accent"], outline="", tags="fill")
+            # Playhead circle
+            tl_canvas.create_oval(fill_x - 6, 5, fill_x + 6, 17,
+                                  fill=COL["accent_hi"], outline="", tags="head")
+        # Time labels
+        tl_canvas.create_text(PAD - 4, 11, text=_tl_fmt(elapsed), anchor="e",
+                              fill=COL["muted"], font=("Segoe UI", 8))
+        tl_canvas.create_text(w - PAD + 4, 11, text=_tl_fmt(dur), anchor="w",
+                              fill=COL["dim"], font=("Segoe UI", 8))
+
+    def _tl_tick():
+        if _tl["t0"] is not None:
+            _tl_draw()
+            _tl["after_id"] = root.after(250, _tl_tick)
+
+    def _tl_seek(event):
+        dur = _tl["dur"]
+        if not dur: return
+        w = tl_canvas.winfo_width()
+        PAD = 52
+        track_px = max(1, w - PAD * 2)
+        frac = max(0.0, min(1.0, (event.x - PAD) / track_px))
+        seek_to = frac * dur
+        # Generation counter: prevents stale _rerun threads from clearing t0
+        _tl["gen"] = _tl.get("gen", 0) + 1
+        gen = _tl["gen"]
+        _tl["offset"] = seek_to
+        _tl["t0"] = time.time()
+        kind = _tl.get("kind")
+        if kind:
+            path = vars_[kind].get()
+            if path and os.path.exists(path):
+                # Kill existing playback
+                for key, proc in list(_media_procs.items()):
+                    if proc:
+                        try:
+                            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                           creationflags=CREATE_NO_WINDOW)
+                        except Exception: pass
+                        _media_procs[key] = None
+                ffplay_ = _find_exe("ffplay")
+                if ffplay_:
+                    def _rerun(fp=ffplay_, p=path, st=seek_to, g=gen):
+                        cmd = [fp, "-nodisp", "-autoexit", "-ss", str(st),
+                               "-volume", str(_player_vol[0]), p]
+                        proc = subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW)
+                        _media_procs["audio"] = proc
+                        proc.wait()
+                        _media_procs["audio"] = None
+                        # Only reset timeline if this seek is still the active one
+                        if _tl.get("gen") == g:
+                            _tl["t0"] = None
+                            root.after(0, _tl_draw)
+                            root.after(0, lambda: btn_play_pause.configure(text="▶"))
+                    threading.Thread(target=_rerun, daemon=True).start()
+        _tl_draw()
+
+    tl_canvas.bind("<Button-1>", _tl_seek)
+    # Draw empty bar once canvas is realized
+    tl_canvas.bind("<Configure>", lambda e: _tl_draw())
 
     # NOT registered with styled() — we manage its look manually so refresh_theme
     # never overwrites the image we set in _update_player_ui
     art_lbl = tk.Label(player_bar, text="🎵", font=("Segoe UI", 24),
                        bg=COL["card2"], fg=COL["muted"])
-    art_lbl.place(x=16, y=14, width=62, height=62)
+    art_lbl.place(x=16, y=36, width=62, height=62)
 
     np_title = styled(tk.Label(player_bar, text="No Song Loaded", font=("Segoe UI Semibold", 11)), bg="card2", fg="fg")
-    np_title.place(x=92, y=24)
+    np_title.place(x=92, y=46)
     np_artist = styled(tk.Label(player_bar, text="Load a GP file to begin.", font=("Segoe UI", 9)), bg="card2", fg="muted")
-    np_artist.place(x=92, y=46)
+    np_artist.place(x=92, y=68)
 
     center_frame = styled(tk.Frame(player_bar), bg="card2")
-    center_frame.place(relx=0.5, y=45, anchor="center")
+    center_frame.place(relx=0.5, y=67, anchor="center")
 
     # Shared media process tracker — keyed by "audio" or "video"
     _media_procs = {"audio": None, "video": None}
+    _player_vol  = [80]   # 0-100, used by all ffplay launches
+
+    def _stop_audio_proc():
+        """Kill just the audio ffplay process without resetting UI."""
+        proc = _media_procs.get("audio")
+        if proc:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                   creationflags=CREATE_NO_WINDOW)
+                else:
+                    proc.kill()
+            except Exception: pass
+            _media_procs["audio"] = None
 
     def _stop_all_media():
-        """Kill every active ffplay process."""
-        for key, proc in list(_media_procs.items()):
-            if proc:
-                try:
-                    if sys.platform == "win32":
-                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                                       creationflags=CREATE_NO_WINDOW)
-                    else:
-                        proc.kill()
-                except Exception: pass
-                _media_procs[key] = None
-        root.after(0, lambda: btn_playfull.configure(text="▶ Play Full Audio"))
-        root.after(0, lambda: btn_playprev.configure(text="▶ Play 30s Preview"))
-        root.after(0, lambda: main_vid_play_btn.configure(text="▶ Play Video Preview"))
+        """Kill every active ffplay process and reset UI."""
+        _stop_audio_proc()
+        proc = _media_procs.get("video")
+        if proc:
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                                   creationflags=CREATE_NO_WINDOW)
+                else:
+                    proc.kill()
+            except Exception: pass
+            _media_procs["video"] = None
+        try:
+            root.after(0, lambda: main_vid_play_btn.configure(text="▶ Play Video Preview"))
+        except Exception: pass
+        _tl["t0"] = None
+        _tl["offset"] = 0.0
+        root.after(0, _tl_draw)
+        root.after(0, lambda: btn_play_pause.configure(text="▶"))
 
-    def _play_media(kind):
+    def _play_media(kind="audio"):
+        """Play/pause toggle. kind='audio' plays the full track."""
         path = vars_[kind].get()
         if not path or not os.path.exists(path):
-            return messagebox.showwarning("Not Found", f"Could not find {kind}. Auto-fetch or browse first.")
+            return messagebox.showwarning("No Audio",
+                "No audio file loaded. Load a .gp file and auto-fetch audio first.")
         ffplay = _find_exe("ffplay")
         if not ffplay:
             try:
                 if sys.platform == "win32": os.startfile(path)
-                else: subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", path])
-            except Exception as e: log(f"Playback failed: {e}")
+                else: subprocess.Popen(["xdg-open", path])
+            except Exception as e:
+                log(f"Playback failed: {e}")
             return
-        # If already playing this kind, clicking again = stop
-        if _media_procs["audio"]:
-            _stop_all_media()
+
+        # ── PAUSE: audio is running → freeze position, kill proc ──────────
+        if _media_procs["audio"] and _tl.get("t0") is not None:
+            elapsed = min(time.time() - _tl["t0"] + _tl["offset"], _tl["dur"] or 1e9)
+            _tl["offset"] = elapsed
+            _tl["t0"] = None
+            _stop_audio_proc()
+            root.after(0, lambda: btn_play_pause.configure(text="▶"))
+            root.after(0, _tl_draw)
             return
-        # Stop video too — only one thing plays at a time
+
+        # ── PLAY / RESUME ─────────────────────────────────────────────────
+        start_at = _tl["offset"] if (_tl.get("t0") is None and _tl["offset"] > 0
+                                      and _tl.get("kind") == kind) else 0.0
         _stop_all_media()
-        btn_playfull.configure(text="⏹ Stop" if kind == "audio" else "▶ Play Full Audio")
-        btn_playprev.configure(text="⏹ Stop" if kind == "preview_audio" else "▶ Play 30s Preview")
-        def _run():
+        root.after(0, lambda: btn_play_pause.configure(text="⏸"))
+        _tl["kind"]   = kind
+        _tl["offset"] = start_at
+        _tl["t0"]     = time.time()
+        # Bump generation so seek/volume threads don't clobber each other
+        _tl["gen"] = _tl.get("gen", 0) + 1
+        _run_gen = _tl["gen"]
+
+        def _load_dur(p=path):
+            d = _tl_get_duration(p)
+            _tl["dur"] = d
+            root.after(0, _tl_draw)
+        threading.Thread(target=_load_dur, daemon=True).start()
+        root.after(0, _tl_tick)
+
+        def _run(st=start_at, p=path, g=_run_gen):
             try:
-                cmd = [ffplay, "-nodisp", "-autoexit", "-volume", "80", path]
+                cmd = [ffplay, "-nodisp", "-autoexit",
+                       "-ss", str(st), "-volume", str(_player_vol[0]), p]
                 proc = subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW)
                 _media_procs["audio"] = proc
                 proc.wait()
@@ -2581,102 +3569,98 @@ def run_gui():
                 root.after(0, lambda: log(f"Playback failed: {e}"))
             finally:
                 _media_procs["audio"] = None
-                root.after(0, lambda: btn_playfull.configure(text="▶ Play Full Audio"))
-                root.after(0, lambda: btn_playprev.configure(text="▶ Play 30s Preview"))
+                # Only reset UI if no newer seek/volume-restart has taken over
+                if _tl.get("gen") == g:
+                    _tl["t0"] = None
+                    _tl["offset"] = 0.0
+                    root.after(0, _tl_draw)
+                    root.after(0, lambda: btn_play_pause.configure(text="▶"))
         threading.Thread(target=_run, daemon=True).start()
 
-    btn_playfull = tk.Button(center_frame, text="▶ Play Full Audio", command=lambda: _play_media("audio"), font=("Segoe UI Semibold", 9), cursor="hand2", padx=16, pady=6, bd=0, relief="flat")
-    styled(btn_playfull, bg="surface", fg="fg", activebackground="border_hi"); btn_playfull.pack(side="left", padx=6)
+    # ── Player controls (identical style for both buttons) ────────────────
+    _pbkw = dict(font=("Segoe UI", 13), cursor="hand2",
+                 padx=16, pady=5, bd=0, relief="flat")
 
-    btn_playprev = tk.Button(center_frame, text="▶ Play 30s Preview", command=lambda: _play_media("preview_audio"), font=("Segoe UI Semibold", 9), cursor="hand2", padx=16, pady=6, bd=0, relief="flat")
-    styled(btn_playprev, bg="surface", fg="fg", activebackground="border_hi"); btn_playprev.pack(side="left", padx=6)
+    btn_play_pause = tk.Button(center_frame, text="▶", width=3,
+                               command=lambda: _play_media("audio"), **_pbkw)
+    styled(btn_play_pause, bg="surface", fg="fg", activebackground="border_hi")
+    btn_play_pause.pack(side="left", padx=4)
 
-    btn_stop_all = tk.Button(center_frame, text="⏹", command=_stop_all_media,
-                             font=("Segoe UI Semibold", 11), cursor="hand2",
-                             padx=10, pady=6, bd=0, relief="flat")
-    styled(btn_stop_all, bg="surface", fg="warn", activebackground="border_hi")
-    btn_stop_all.pack(side="left", padx=6)
+    btn_stop_all = tk.Button(center_frame, text="■",
+                             command=_stop_all_media, **_pbkw)
+    styled(btn_stop_all, bg="surface", fg="fg", activebackground="border_hi")
+    btn_stop_all.pack(side="left", padx=4)
 
-    status_lbl = styled(tk.Label(player_bar, text="Ready", font=("Segoe UI Semibold", 9)), bg="card2", fg="muted")
-    status_lbl.place(relx=0.98, y=45, anchor="e")
+    # ── Volume slider — click anywhere to jump, release restarts if playing ─
+    def _vol_restart_if_playing():
+        """Restart ffplay at current position so new volume takes effect."""
+        dur = _tl.get("dur", 0)
+        kind = _tl.get("kind")
+        if not dur or not kind:
+            return
+        t0 = _tl.get("t0")
+        elapsed = (min(time.time() - t0 + _tl["offset"], dur)
+                   if t0 is not None else _tl["offset"])
+        if elapsed <= 0:
+            return
+        _tl["offset"] = elapsed
+        _tl["gen"] = _tl.get("gen", 0) + 1
+        gen = _tl["gen"]
+        _tl["t0"] = time.time()
+        path = vars_[kind].get()
+        ffplay_ = _find_exe("ffplay")
+        if not ffplay_ or not path or not os.path.exists(path):
+            return
+        _stop_audio_proc()
+        def _vrestart(fp=ffplay_, p=path, st=elapsed, g=gen):
+            cmd = [fp, "-nodisp", "-autoexit", "-ss", str(st),
+                   "-volume", str(_player_vol[0]), p]
+            proc = subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW)
+            _media_procs["audio"] = proc
+            proc.wait()
+            _media_procs["audio"] = None
+            if _tl.get("gen") == g:
+                _tl["t0"] = None
+                _tl["offset"] = 0.0
+                root.after(0, _tl_draw)
+                root.after(0, lambda: btn_play_pause.configure(text="▶"))
+        threading.Thread(target=_vrestart, daemon=True).start()
+        root.after(0, lambda: btn_play_pause.configure(text="⏸"))
 
-    _art_photo_ref = [None]  # module-level GC anchor separate from label
+    vol_frame = styled(tk.Frame(player_bar), bg="card2")
+    vol_frame.place(relx=0.86, y=67, anchor="center")
+    tk.Label(vol_frame, text="🔊", font=("Segoe UI", 10),
+             bg=COL["card2"], fg=COL["muted"]).pack(side="left")
+    vol_slider = tk.Scale(vol_frame, from_=0, to=100, orient="horizontal",
+                          length=120, showvalue=False, resolution=1,
+                          bg=COL["card2"], fg=COL["muted"],
+                          troughcolor=COL["border_hi"],
+                          activebackground=COL["accent"],
+                          highlightthickness=0, bd=0, cursor="hand2",
+                          command=lambda v: _player_vol.__setitem__(0, int(float(v))))
+    vol_slider.set(80)
+    vol_slider.pack(side="left", padx=(4, 0))
 
-    def _update_player_ui():
-        np_title.configure(text=vars_["title"].get() or "Unknown Title")
-        np_artist.configure(text=vars_["artist"].get() or "Unknown Artist")
-        art_path = vars_["art"].get().strip()
-        if art_path and os.path.exists(art_path):
-            if HAS_PIL:
-                try:
-                    img = Image.open(art_path).convert("RGB").resize((62, 62), Image.Resampling.LANCZOS)
-                    photo = ImageTk.PhotoImage(img)
-                    _art_photo_ref[0] = photo
-                    art_lbl.configure(image=photo, text="", bg=COL["card2"])
-                    art_lbl.image = photo
-                    return  # success — exit early
-                except Exception as e:
-                    log(f"  [art] thumbnail error: {e}")
-            # PIL unavailable or failed — show art file name as hint
-            art_lbl.configure(image="", text="🖼", bg=COL["accent"],
-                              font=("Segoe UI", 14))
-            art_lbl.image = None
-            _art_photo_ref[0] = None
-        else:
-            _art_photo_ref[0] = None
-            art_lbl.configure(image="", text="🎵", bg=COL["card2"],
-                              font=("Segoe UI", 24))
-            art_lbl.image = None
+    # Click or drag anywhere on trough → jump/drag to that value immediately
 
-    # Auto-refresh player bar whenever art/title/artist vars change
-    def _on_art_change(*_):
-        root.after(150, _update_player_ui)
-    vars_["art"].trace_add("write", _on_art_change)
-    vars_["title"].trace_add("write", lambda *_: root.after(50, _update_player_ui))
-    vars_["artist"].trace_add("write", lambda *_: root.after(50, _update_player_ui))
+    # Click or drag anywhere on trough → jump/drag to that value immediately
+    def _vol_jump(e):
+        pad = 8
+        w = vol_slider.winfo_width() - pad * 2
+        frac = max(0.0, min(1.0, (e.x - pad) / max(1, w)))
+        vol_slider.set(int(frac * 100))
+        # do NOT return "break" — lets Tk establish the mouse grab for dragging
 
-    # ── AUTOMAGIC ────────────────────────────────────────────────────────
-    def _trigger_automagic(confirmed_url=None):
-        artist = vars_["artist"].get().strip(); title2 = vars_["title"].get().strip(); out_dir = vars_["out"].get()
-        if not out_dir or not artist or not title2: return
-        if confirmed_url:
-            main_vid_state["url"] = confirmed_url
-            root.after(0, lambda: main_vid_play_btn.configure(state="normal", bg=COL["card2"], fg=COL["fg"]))
-        log("\n⚡ Starting Media Download & Data Extraction...")
-        status_lbl.configure(text="⚡ Downloading...", fg=COL["accent"])
-        def worker():
-            res = fetch_media_pack(artist, title2, out_dir, confirmed_url, log)
-            def apply():
-                if res["art"]:     vars_["art"].set(res["art"])
-                if res["lyrics"]:  vars_["lyrics"].set(res["lyrics"])
-                if res["audio"]:   vars_["audio"].set(res["audio"])
-                if res["preview"]: vars_["preview_audio"].set(res["preview"])
-                # Guard: only write if we have data AND current value is still blank/default
-                cur_album = vars_["album"].get().strip()
-                cur_year  = vars_["year"].get().strip()
-                # Write album if we got one and field is still blank/default
-                if res["album"] and cur_album in ("", "Unknown Album"):
-                    vars_["album"].set(res["album"])
-                # Only write year if we actually got one (don't overwrite good data with blank)
-                if res["year"]:
-                    vars_["year"].set(res["year"])
-                status_lbl.configure(text="✓ Ready", fg=COL["muted"])
-                log("⚡ Auto-Fetch Complete.")
-                # Delayed art update — give PIL time after the var write
-                root.after(300, _update_player_ui)
-            root.after(0, apply)
-        threading.Thread(target=worker, daemon=True).start()
+    vol_slider.bind("<Button-1>", _vol_jump)
+    vol_slider.bind("<B1-Motion>", _vol_jump)
+    vol_slider.bind("<ButtonRelease-1>", lambda e: _vol_restart_if_playing())
 
-    # ── BPM auto-detect (Main page) ───────────────────────────────────────
-    def _set_bpm_from_gp(path):
-        bpm = detect_gp_bpm(path)
-        if bpm:
-            txt = f"{bpm:.3f}".rstrip("0").rstrip(".")
-            vars_["bpm"].set(txt)
-            log(f"  [tempo] Detected {txt} BPM from GP file")
-            return True
-        return False
+    status_lbl = styled(tk.Label(player_bar, text="Ready",
+                                  font=("Segoe UI Semibold", 9)),
+                         bg="card2", fg="muted")
+    status_lbl.place(relx=0.99, y=67, anchor="e")
 
+    # ══ BPM RE-DETECT ═══════════════════════════════════════════════════════════════════════════════
     def _redetect_bpm():
         path = vars_["gp"].get().strip()
         if not path or not os.path.exists(path):
@@ -2684,186 +3668,184 @@ def run_gui():
         if not _set_bpm_from_gp(path):
             messagebox.showinfo("BPM", "Couldn't detect a tempo automatically — enter it manually.")
 
-    # ── FIX 2: load_gp — defer media inspector so main thread stays free ─
+    # ══ LOAD GP ════════════════════════════════════════════════════════════════════════════════════════
     def load_gp(path):
+        vars_["gp"].set(path)           # always sync the GP field
+        startup_overlay.place_forget()
         for w in arr_grid.winfo_children(): w.destroy()
         track_rows.clear()
-        try: gp = gp2rs.GPSong(path)
+        try:
+            gp = gp2rs.GPSong(path)
         except Exception as e:
-            return messagebox.showerror("Can't read file", f"Not a valid GP7/8 .gp file:\n{e}")
-        _gp_ref[0] = gp   # store for Sync Tuner access
-
+            return messagebox.showerror("Can't read file",
+                                        f"Not a valid GP7/8 .gp file:\n{e}")
+        _gp_ref[0] = gp
         title2, artist2 = gp.title, gp.artist
         m = re.match(r"^(.*)\s+by\s+(.+)$", title2, re.I)
         if m: title2, artist2 = m.group(1).strip(), m.group(2).strip()
         vars_["title"].set(title2); vars_["artist"].set(artist2)
-
         gp_album = gp.album.strip()
         vars_["album"].set(gp_album if gp_album else "Unknown Album")
-
         if not _set_bpm_from_gp(path):
             if not vars_["bpm"].get().strip():
                 vars_["bpm"].set("120")
-            log("  [tempo] Could not auto-detect BPM — edit the field manually if needed")
-
+            log("  [tempo] Could not auto-detect BPM — edit manually if needed")
+        _save_project_to_history(
+            vars_["title"].get(), vars_["artist"].get(), path,
+            None, vars_["art"].get() or None)
         if not vars_["out"].get():
             vars_["out"].set(os.path.dirname(os.path.abspath(path)))
-
         _update_player_ui()
-
-        # ← deferred so tkinter finishes rendering the GP info first
-        root.after(50, lambda: ensure_dependencies_then_run(_show_media_inspector))
-
+        # Only auto-fetch if audio hasn't already been restored from project history
+        _existing_audio = vars_["audio"].get().strip()
+        if not _existing_audio or not os.path.exists(_existing_audio):
+            root.after(50, lambda: ensure_dependencies_then_run(_show_media_inspector))
         headers = ["", "Track", "Arrangement", "Tone preset"]
-        widths  = [3, 28, 12, 22]
+        widths   = [3, 28, 12, 22]
         for ci, (h, wd) in enumerate(zip(headers, widths)):
-            styled(tk.Label(arr_grid, text=h.upper(), font=("Segoe UI", 8), width=wd, anchor="w"), fg="muted", bg="card").grid(row=0, column=ci, sticky="w", padx=(0 if ci == 0 else 8, 0), pady=(0, 6))
-
+            styled(tk.Label(arr_grid, text=h, font=("Segoe UI Semibold", 8)),
+                   fg="muted", bg="card").grid(row=0, column=ci, sticky="w",
+                   padx=6, pady=(0, 4), ipadx=wd)
         guitars = 0
         for i in range(len(gp.tracks)):
             kind = gp.track_kind(i)
-            if kind is None: continue
+            if kind is None:
+                continue
             name = " ".join((gp.tracks[i].findtext("Name") or f"Track {i}").split())
+            tuning_str = gp.tuning(i)
             preset = auto_preset(name)
             if kind == "bass":
-                arr, tone_opts = "Bass", BASS_PRESETS
+                arr, tones = "Bass", BASS_PRESETS
+                if preset not in tones:
+                    preset = "Bass - Rock"
             else:
-                arr, tone_opts = ("Lead" if guitars == 0 else "Rhythm"), GUITAR_PRESETS
+                arr, tones = ("Lead" if guitars == 0 else "Rhythm"), GUITAR_PRESETS
+                if preset not in tones:
+                    preset = "Distortion - JCM800" if arr == "Lead" else "Crunch - JTM45"
                 guitars += 1
-            row = {"index": i, "var_include": tk.BooleanVar(value=True), "var_arr": tk.StringVar(value=arr), "var_tone": tk.StringVar(value=preset)}
+            row = {"index": i, "var_include": tk.BooleanVar(value=True),
+                   "var_arr": tk.StringVar(value=arr),
+                   "var_tone": tk.StringVar(value=preset)}
             r = len(track_rows) + 1
-            ttk.Checkbutton(arr_grid, variable=row["var_include"]).grid(row=r, column=0, padx=(0, 4), pady=4, sticky="w")
-            styled(tk.Label(arr_grid, text=f"{name}  ({gp.tuning(i)})", font=("Segoe UI", 10), anchor="w"), fg="fg", bg="card").grid(row=r, column=1, sticky="w", padx=(0, 8), pady=4)
-            ttk.Combobox(arr_grid, textvariable=row["var_arr"], width=10, state="readonly", values=["Lead", "Rhythm", "Bass", "Skip"]).grid(row=r, column=2, padx=(0, 8), pady=4, sticky="w")
-            ttk.Combobox(arr_grid, textvariable=row["var_tone"], width=24, state="readonly", values=PRESET_LABELS).grid(row=r, column=3, pady=4, sticky="w")
+            tk.Checkbutton(arr_grid, variable=row["var_include"],
+                           bg=COL["card"], activebackground=COL["card"],
+                           fg=COL["fg"], selectcolor=COL["field"],
+                           relief="flat", bd=0).grid(row=r, column=0, padx=6, pady=3)
+            styled(tk.Label(arr_grid, text=f"{name}  ({tuning_str})",
+                            font=("Segoe UI", 9), anchor="w"),
+                   fg="fg", bg="card").grid(row=r, column=1, sticky="w", padx=6, pady=3)
+            ttk.Combobox(arr_grid, textvariable=row["var_arr"], width=9,
+                         state="readonly",
+                         values=["Lead", "Rhythm", "Bass", "Skip"]).grid(
+                row=r, column=2, padx=6, pady=3)
+            ttk.Combobox(arr_grid, textvariable=row["var_tone"], width=22,
+                         state="readonly", values=tones).grid(
+                row=r, column=3, padx=6, pady=3)
             track_rows.append(row)
+        arr_hint.configure(text=f"Loaded {os.path.basename(path)} — {len(track_rows)} track(s)")
+        log(f"Loaded: {os.path.basename(path)} — {len(track_rows)} track(s)")
 
-        arr_hint.configure(text=f"{os.path.basename(path)}  •  {len(track_rows)} playable track(s)")
-        log(f"Loaded GP: {os.path.basename(path)}")
-        # Refresh sync tuner track panel
-        root.after(100, _build_track_panel)
+    # ══ BUILD ════════════════════════════════════════════════════════════════════════════════════════
 
-    show_page("main")
-
+    # ══ BUILD ════════════════════════════════════════════════════════════════════════════════════════
     def do_build():
-        if not vars_["gp"].get() or not vars_["out"].get():
-            return messagebox.showwarning("Missing info", "Pick a GP file and Output Folder.")
-
-        # ── Build progress modal ─────────────────────────────────────────
-        root.update_idletasks()
-        rx = root.winfo_rootx(); ry = root.winfo_rooty()
-        rw = root.winfo_width();  rh = root.winfo_height()
-
-        prog_backdrop = tk.Toplevel(root)
-        prog_backdrop.overrideredirect(True)
-        prog_backdrop.geometry(f"{rw}x{rh}+{rx}+{ry}")
-        prog_backdrop.configure(bg="#000000")
-        prog_backdrop.attributes("-alpha", 0.65)
-        prog_backdrop.transient(root)
-        prog_backdrop.lift()
-
-        prog_win = tk.Toplevel(root)
-        prog_win.title("Building CDLC")
-        prog_win.transient(root)
-        prog_win.configure(bg=COL["card"])
-        prog_win.resizable(False, False)
-        pw, ph = 480, 200
-        prog_win.geometry(f"{pw}x{ph}+{rx+(rw-pw)//2}+{ry+(rh-ph)//2}")
-        prog_win.lift()
-        prog_win.grab_set()
-
-        styled(tk.Frame(prog_win, height=4), bg="accent").pack(fill="x")
-        styled(tk.Label(prog_win, text="Creating CDLC", font=("Segoe UI Semibold", 14)), fg="fg", bg="card").pack(pady=(20, 4))
-        prog_step_var = tk.StringVar(value="Initializing…")
-        styled(tk.Label(prog_win, textvariable=prog_step_var, font=("Segoe UI", 9)), fg="muted", bg="card").pack(pady=(0, 12))
-
-        pbar = ttk.Progressbar(prog_win, mode="indeterminate", length=380)
-        pbar.pack(pady=(0, 16))
-        pbar.start(12)
-
-        log_mini = styled(tk.Label(prog_win, text="", font=("Consolas", 8), anchor="w", justify="left"), fg="dim", bg="card")
-        log_mini.pack(fill="x", padx=24)
-
-        build_btn.configure(state="disabled", text="Building CDLC…")
-
-        def _prog_log(msg):
-            log(msg)
-            short = msg.strip()[:72]
-            root.after(0, lambda: log_mini.configure(text=short))
-            root.after(0, lambda: prog_step_var.set(short[:60] + ("…" if len(short) > 60 else "")))
-
-        def _close_prog():
-            try: prog_win.grab_release()
-            except Exception: pass
-            try: prog_win.destroy()
-            except Exception: pass
-            try: prog_backdrop.destroy()
-            except Exception: pass
-
-        # Build stages for determinate feel — switch to determinate after parsing
-        _stages = [
-            "Parsing Guitar Pro file…",
-            "Converting audio to 48kHz WAV…",
-            "Writing arrangement XML…",
-            "Applying tone presets…",
-            "Writing .rs2dlc project…",
-            "Running DDC (dynamic difficulty)…",
-            "Packaging PSARC…",
-            "Done!",
-        ]
-        _stage_idx = [0]
-        def _advance_stage(label=None):
-            txt = label or (_stages[_stage_idx[0]] if _stage_idx[0] < len(_stages) else "Finalizing…")
-            _stage_idx[0] += 1
-            root.after(0, lambda: prog_step_var.set(txt))
-
+        if not vars_["gp"].get():
+            return messagebox.showwarning("Missing", "Pick a .gp file first.")
+        if not vars_["out"].get():
+            return messagebox.showwarning("Missing", "Pick a Project Folder first.")
+        arrs = [r["var_arr"].get() for r in track_rows
+                if r["var_include"].get() and r["var_arr"].get() != "Skip"]
+        if len(arrs) != len(set(arrs)):
+            return messagebox.showwarning(
+                "Duplicate arrangement",
+                "Two tracks share the same arrangement type.\n"
+                "Make them unique or set one to Skip.")
+        btn_rebuild.configure(state="disabled", text="Building…")
         o = SimpleNamespace(
-            gp_path=vars_["gp"].get(), lyrics_path=vars_["lyrics"].get() or None,
-            audio_path=vars_["audio"].get() or None, preview_path=vars_["preview_audio"].get() or None,
-            art_path=vars_["art"].get() or None, out_dir=vars_["out"].get(),
-            title=vars_["title"].get() or "Unknown", artist=vars_["artist"].get() or "Unknown",
-            album=vars_["album"].get(), year=vars_["year"].get(),
-            leadin=float(vars_["leadin"].get() or 10), volume=float(vars_["volume"].get() or -8),
-            appid=vars_["appid"].get() or "248750", scroll_speed=vars_["scroll_speed"].get() or "1.3",
-            pitch=vars_["pitch"].get() or "440.0", use_ddc=use_ddc.get(),
-            bpm=float(vars_["bpm"].get() or 120),
-            make_psarc=bool(psarc_var.get()), packer_path=vars_["packer"].get() or None,
-            cst_dir=vars_["cst"].get() or None,
-            tracks=[{"index": r["index"], "include": r["var_include"].get(), "arr": r["var_arr"].get(), "tone_label": r["var_tone"].get()} for r in track_rows])
-
+            gp_path       = vars_["gp"].get(),
+            lyrics_path   = vars_["lyrics"].get() or None,
+            audio_path    = vars_["audio"].get() or None,
+            audio_url     = vars_["audio_url"].get().strip() or None,
+            art_path      = vars_["art"].get() or None,
+            out_dir       = vars_["out"].get(),
+            psarc_dest    = vars_["psarc_out"].get().strip() or None,
+            title         = vars_["title"].get() or "Unknown",
+            artist        = vars_["artist"].get() or "Unknown",
+            album         = vars_["album"].get(),
+            year          = vars_["year"].get(),
+            leadin        = float(vars_["leadin"].get() or 5),
+            volume        = float(vars_["volume"].get() or -8),
+            scroll_speed  = float(vars_["scroll_speed"].get() or 1.3),
+            pitch         = float(vars_["pitch"].get() or 440.0),
+            appid         = vars_["appid"].get() or "248750",
+            make_psarc    = bool(psarc_var.get()),
+            packer_path   = vars_["packer"].get() or None,
+            cst_dir       = vars_["cst"].get() or None,
+            tracks        = [
+                {"index": r["index"], "include": r["var_include"].get(),
+                 "arr": r["var_arr"].get(), "tone_label": r["var_tone"].get()}
+                for r in track_rows
+            ],
+        )
         def worker():
             try:
-                _advance_stage("Parsing Guitar Pro file…")
-                res = build_project(o, log=_prog_log)
-                pbar.stop()
-                proj = res["proj_dir"]
+                res   = build_project(o, log=log)
+                pdir  = res["proj_dir"]
                 psarc = res.get("psarc")
-                msg = "CDLC project created!\n\n\U0001f4c1 " + proj
+                if psarc and o.psarc_dest and os.path.isdir(o.psarc_dest):
+                    import shutil as _sh
+                    dest = os.path.join(o.psarc_dest, os.path.basename(psarc))
+                    try:
+                        _sh.copy2(psarc, dest)
+                        log(f"  [psarc] Copied to PSARC folder: {dest}")
+                        psarc = dest
+                    except Exception as ex:
+                        log(f"  [psarc] Copy to PSARC folder failed: {ex}")
                 if psarc:
-                    msg += "\n\n\U0001f4e6 PSARC: " + os.path.basename(psarc)
-                elif o.make_psarc:
-                    if res.get("packer_failed"):
-                        out_snip = (res.get("packer_output","") or "")[:300]
-                        msg += "\n\n\u26a0 PSARC build failed. Check the Log tab for full packer output."
-                        if out_snip:
-                            msg += f"\n\nPacker said:\n{out_snip}"
-                    else:
-                        msg += "\n\n\u26a0 PSARC skipped — packer.exe or Wwise not found.\nOpen the .rs2dlc in DLC Builder to finish."
-                root.after(0, _close_prog)
-                root.after(100, lambda: messagebox.showinfo("CDLC Created", msg))
+                    _save_project_to_history(
+                        o.title, o.artist, o.gp_path, psarc,
+                        vars_["art"].get() or None)
+                    try:
+                        subprocess.Popen(
+                            ["explorer", "/select,", os.path.abspath(psarc)],
+                            creationflags=CREATE_NO_WINDOW)
+                    except Exception:
+                        pass
+                    root.after(0, lambda: show_page("slopsmith"))
+                    root.after(0, lambda: messagebox.showinfo(
+                        "Done — .psarc built!",
+                        f"Success!\n\n{psarc}\n\n"
+                        "Drop it in your Rocksmith dlc folder."))
+                elif res.get("packer_failed"):
+                    tail2 = "\n".join(
+                        (res.get("packer_output") or "").splitlines()[-15:])
+                    msg = (f"Project files created, but packer.exe failed.\n\n"
+                           f"Error:\n{tail2}\n\n(Project: {pdir})")
+                    root.after(0, lambda: messagebox.showerror(
+                        "psarc build failed", msg))
+                else:
+                    root.after(0, lambda: messagebox.showinfo(
+                        "Done",
+                        f"Project built:\n{pdir}\n\n"
+                        "No .psarc — check packer path in Advanced Packer Settings."))
             except Exception as e:
-                pbar.stop()
-                err = traceback.format_exc()
-                log(f"Build failed: {e}\n{err}")
-                root.after(0, _close_prog)
-                root.after(100, lambda: messagebox.showerror("Build Failed", f"{e}"))
+                root.after(0, lambda: log("BUILD ERROR: " + str(e)))
+                root.after(0, lambda: log(traceback.format_exc()))
+                root.after(0, lambda: messagebox.showerror("Build failed", str(e)))
             finally:
-                root.after(0, lambda: build_btn.configure(state="normal", text="▶  Create CDLC"))
+                root.after(0, lambda: btn_rebuild.configure(
+                    state="normal", text="▶  Build CDLC"))
         threading.Thread(target=worker, daemon=True).start()
 
-    refresh_theme(root, ttk)
-    root.mainloop()
+    # ══ INITIAL STATE ════════════════════════════════════════════════════════════════════════════════
+    _gp_init = vars_["gp"].get().strip()
+    if _gp_init and os.path.exists(_gp_init):
+        root.after(200, lambda: load_gp(_gp_init))
+    else:
+        root.after(100, _show_startup_overlay)
 
+    show_page("main")
+    root.mainloop()
 
 if __name__ == "__main__":
     run_gui()
