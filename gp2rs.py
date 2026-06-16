@@ -177,15 +177,19 @@ class GPSong:
             dur = dur * Fraction(int(tup.get("den")), int(tup.get("num")))
         return dur
 
-    def bar_times(self, leadin):
-        """Return (start_seconds, quarters_per_bar, bpm) for each masterbar."""
+    def bar_times(self, leadin, bpm_scale=1.0):
+        """Return (start_seconds, quarters_per_bar, bpm) for each masterbar.
+
+        bpm_scale > 1.0 speeds up the note chart so it fits a shorter audio file.
+        e.g. bpm_scale = gp_duration / audio_duration compresses notes to match audio.
+        """
         out, t = [], leadin
         bpm_idx = 0
-        cur_bpm = self.tempos[0][2]
+        cur_bpm = self.tempos[0][2] * bpm_scale
         for i, mb in enumerate(self.masterbars):
             # tempo changes that land at the start of this bar
             while bpm_idx < len(self.tempos) and self.tempos[bpm_idx][0] <= i:
-                cur_bpm = self.tempos[bpm_idx][2]
+                cur_bpm = self.tempos[bpm_idx][2] * bpm_scale
                 bpm_idx += 1
             n, d = self.time_sig(mb)
             quarters = n * 4 / d
@@ -193,9 +197,9 @@ class GPSong:
             t += quarters * 60.0 / cur_bpm
         return out, t  # t = song body end
 
-    def track_beats(self, ti, leadin):
+    def track_beats(self, ti, leadin, bpm_scale=1.0):
         """Yield GPBeat list (merged voices, time-ordered) for a track."""
-        bar_times, _ = self.bar_times(leadin)
+        bar_times, _ = self.bar_times(leadin, bpm_scale=bpm_scale)
         all_beats = []
         for i, mb in enumerate(self.masterbars):
             bar_id = mb.findtext("Bars").split()[ti]
@@ -260,8 +264,8 @@ class RSNote:
         self.max_bend = max((v for _, v in self.bend_pts), default=0)
 
 
-def convert_track(gp, ti, leadin, sustain_min=0.40):
-    beats, bar_times = gp.track_beats(ti, leadin)
+def convert_track(gp, ti, leadin, sustain_min=0.40, bpm_scale=1.0):
+    beats, bar_times = gp.track_beats(ti, leadin, bpm_scale=bpm_scale)
     tun = gp.tuning(ti)
     eff, dropped = gp.effective_tuning(ti)
     notes = []
@@ -460,10 +464,18 @@ def render_chords(chords, indent="        "):
 
 def make_arrangement(gp, ti, args):
     leadin = args.leadin
-    notes, beats, bar_times = convert_track(gp, ti, leadin)
+    bpm_scale = getattr(args, "bpm_scale", 1.0)
+    notes, beats, bar_times = convert_track(gp, ti, leadin, bpm_scale=bpm_scale)
     singles, chords, templates = group_chords(notes)
     body_end = bar_times[-1][0] + bar_times[-1][1] * 60.0 / bar_times[-1][2]
-    song_len = body_end + 3.0
+    # Use audio duration if available so SongLength always spans the full audio file.
+    # Without this, GP files with fewer bars than the audio length cause notes to
+    # cut off early in Rocksmith while the audio keeps playing.
+    audio_dur = getattr(args, "audio_duration", None)
+    if audio_dur and audio_dur > body_end + 3.0:
+        song_len = audio_dur + 1.0   # tiny buffer so Rocksmith doesn't clip the tail
+    else:
+        song_len = body_end + 3.0
 
     # ebeats
     ebeats = []
@@ -481,6 +493,22 @@ def make_arrangement(gp, ti, args):
             sec_starts.append((bar_times[i][0], map_section(sec.findtext("Text"))))
     if not sec_starts or sec_starts[0][0] > leadin:
         sec_starts.insert(0, (leadin, "intro"))
+
+    # If the GP file has no section markers (only the auto-inserted intro),
+    # generate sections every ~16 bars so Riff Repeater works properly.
+    if len(sec_starts) == 1 and sec_starts[0][1] == "intro":
+        seg_names = ["intro", "verse", "chorus", "verse", "chorus",
+                     "bridge", "chorus", "outro"]
+        seg_idx = 0
+        interval = max(8, len(bar_times) // max(1, len(seg_names)))
+        sec_starts = []
+        for bar_i, (bt, _q, _bpm) in enumerate(bar_times):
+            if bar_i == 0:
+                sec_starts.append((bt, "intro"))
+                seg_idx = 1
+            elif bar_i > 0 and bar_i % interval == 0 and seg_idx < len(seg_names):
+                sec_starts.append((bt, seg_names[seg_idx]))
+                seg_idx += 1
     counts = {}
     sections = []
     for t, name in sec_starts:
@@ -852,25 +880,4 @@ def _auto_invocation():
                 sys.argv += (["--lrc", cand] if cand.endswith(".lrc") else ["--lyrics-txt", cand])
                 print(f"found lyrics file: {os.path.basename(cand)}")
                 break
-        return True
-    return False
-
-
-def _pause():
-    try:
-        input("\nDone! Press Enter to close...")
-    except EOFError:
-        pass
-
-
-if __name__ == "__main__":
-    auto = _auto_invocation()
-    try:
-        main()
-    except Exception as e:
-        print(f"\nERROR: {e}")
-        if auto:
-            _pause()
-        raise
-    if auto:
-        _pause()
+        r

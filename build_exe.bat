@@ -43,9 +43,10 @@ echo Step 2/3: Checking for ffmpeg...
 if exist "%~dp0ffmpeg.exe" (
     echo   ffmpeg.exe already present.
 ) else (
-    echo   Downloading ffmpeg from gyan.dev...
-    powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile '$env:TEMP\ff.zip' -UseBasicParsing; Expand-Archive -Force '$env:TEMP\ff.zip' '$env:TEMP\ff'; $exe = Get-ChildItem -Recurse -Filter ffmpeg.exe '$env:TEMP\ff' | Select-Object -First 1; if ($exe) { Copy-Item $exe.FullName '%~dp0ffmpeg.exe'; Write-Host '  ffmpeg.exe downloaded.' } else { Write-Host '  ffmpeg.exe not found in archive.' } } catch { Write-Host ('  Download failed: ' + $_.Exception.Message) }"
-    if not exist "%~dp0ffmpeg.exe" echo   ffmpeg missing - add ffmpeg.exe here manually before distributing.
+    echo   Downloading ffmpeg + ffplay from gyan.dev...
+    powershell -NoProfile -Command "try { Invoke-WebRequest -Uri 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip' -OutFile '$env:TEMP\ff.zip' -UseBasicParsing; Expand-Archive -Force '$env:TEMP\ff.zip' '$env:TEMP\ff'; $f1 = Get-ChildItem -Recurse -Filter ffmpeg.exe '$env:TEMP\ff' | Select-Object -First 1; if ($f1) { Copy-Item $f1.FullName '%~dp0ffmpeg.exe'; Write-Host '  ffmpeg.exe downloaded.' } else { Write-Host '  ffmpeg.exe not found in archive.' }; $f2 = Get-ChildItem -Recurse -Filter ffplay.exe '$env:TEMP\ff' | Select-Object -First 1; if ($f2) { Copy-Item $f2.FullName '%~dp0ffplay.exe'; Write-Host '  ffplay.exe downloaded.' } else { Write-Host '  ffplay.exe not found in archive.' } } catch { Write-Host ('  Download failed: ' + $_.Exception.Message) }"
+    if not exist "%~dp0ffmpeg.exe" echo   ffmpeg missing - add ffmpeg.exe manually.
+    if not exist "%~dp0ffplay.exe" echo   ffplay missing - add ffplay.exe manually.
 )
 
 :: Step 3: PyInstaller build
