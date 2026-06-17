@@ -1030,7 +1030,8 @@ def build_project(o, log=print):
         cst_arrs.append(dict(arr_name=trk["arr"], arr_type={"Lead": "Guitar", "Rhythm": "Guitar", "Bass": "Bass"}[trk["arr"]], route_mask=trk["arr"], xml_path=xml_full, master_id=random.randint(1, 2**31 - 1), id=uuid.uuid4(), tone_key=tone_key, tuning=offs, tuning_pitch=float(o.pitch), tuning_name="Custom", scroll=int(round(float(o.scroll_speed)*10))))
     vocals_name = None
     if o.lyrics_path:
-        vxml = gp2rs.lrc_to_vocals(o.lyrics_path, o.leadin) if o.lyrics_path.endswith(".lrc") else gp2rs.lyrics_txt_to_vocals(o.lyrics_path, gp, o.leadin)
+        _lrc_off = getattr(o, "lrc_offset", 0.0)
+        vxml = gp2rs.lrc_to_vocals(o.lyrics_path, o.leadin, lrc_offset=_lrc_off) if o.lyrics_path.endswith(".lrc") else gp2rs.lyrics_txt_to_vocals(o.lyrics_path, gp, o.leadin)
         vname = f"{key}_vocals.xml"
         vocals_name = vname
         with open(os.path.join(proj_dir, vname), "w", encoding="utf-8") as f: f.write(vxml)
@@ -1132,8 +1133,8 @@ def run_gui():
 
     apply_ttk_theme(root, ttk)
 
-    vars_ = {k: tk.StringVar() for k in ["gp", "lyrics", "audio", "preview_audio", "art", "out", "psarc_out", "title", "artist", "album", "year", "leadin", "volume", "audio_url", "packer", "cst", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "bpm", "bpm_factor"]}
-    vars_["leadin"].set("5.0"); vars_["volume"].set("-8.0"); vars_["year"].set("2026"); vars_["bpm"].set("120"); vars_["bpm_factor"].set("1.000")
+    vars_ = {k: tk.StringVar() for k in ["gp", "lyrics", "audio", "preview_audio", "art", "out", "psarc_out", "title", "artist", "album", "year", "leadin", "volume", "audio_url", "packer", "cst", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "bpm", "bpm_factor", "lrc_offset"]}
+    vars_["leadin"].set("5.0"); vars_["volume"].set("-8.0"); vars_["year"].set("2026"); vars_["bpm"].set("120"); vars_["bpm_factor"].set("1.000"); vars_["lrc_offset"].set("0.0")
     vars_["slop_url"].set("http://localhost:8000")
     vars_["appid"].set("248750"); vars_["scroll_speed"].set("1.3"); vars_["pitch"].set("440.0")
     # Restore persisted paths from settings
@@ -1390,10 +1391,15 @@ def run_gui():
         tools_frame = tk.Frame(outer, bg=COL["surface"])
         tools_frame.pack(fill="x", pady=(0, 16), padx=8)
 
+        def _whisper_ok():
+            import importlib.util
+            return importlib.util.find_spec("faster_whisper") is not None
+
         _TOOL_ROWS = [
-            ("ytdlp",  "yt-dlp",          lambda: bool(_find_exe("yt-dlp"))),
-            ("ffmpeg", "ffmpeg + ffplay",  lambda: bool(_find_exe("ffmpeg") and _find_exe("ffplay"))),
-            ("ddc",    "DDC (optional)",   lambda: bool(_find_exe("ddc") or _find_exe("ddc64"))),
+            ("ytdlp",   "yt-dlp",                   lambda: bool(_find_exe("yt-dlp"))),
+            ("ffmpeg",  "ffmpeg + ffplay",            lambda: bool(_find_exe("ffmpeg") and _find_exe("ffplay"))),
+            ("ddc",     "DDC (optional)",             lambda: bool(_find_exe("ddc") or _find_exe("ddc64"))),
+            ("whisper", "AI Timestamps (optional)",   _whisper_ok),
         ]
         tv, tl = {}, {}
         for key, label, _ in _TOOL_ROWS:
@@ -1506,6 +1512,32 @@ def run_gui():
                     log("  [setup] ✓ DDC")
                 except Exception:
                     _mark_skip("ddc", "DDC (optional)")
+            _set_pb(85)
+
+            # --- faster-whisper ---
+            if not _whisper_ok():
+                root.after(0, lambda: tv["whisper"].set("⬇  AI Timestamps  (watch CMD window)…"))
+                _set_status("Installing faster-whisper via pip…")
+                try:
+                    subprocess.run(
+                        ["cmd", "/C",
+                         "py -m pip install faster-whisper || python -m pip install faster-whisper"],
+                        creationflags=subprocess.CREATE_NEW_CONSOLE
+                    )
+                    import importlib, sys as _sys
+                    importlib.invalidate_caches()
+                    for _k in list(_sys.modules.keys()):
+                        if "faster_whisper" in _k:
+                            del _sys.modules[_k]
+                    if _whisper_ok():
+                        _mark_ok("whisper", "AI Timestamps (optional)")
+                        log("  [setup] ✓ faster-whisper")
+                    else:
+                        _mark_skip("whisper", "AI Timestamps (optional)")
+                        log("  [setup] faster-whisper not found after install attempt")
+                except Exception as _we:
+                    _mark_skip("whisper", "AI Timestamps (optional)")
+                    log(f"  [setup] faster-whisper install error: {_we}")
             _set_pb(100)
 
             _set_status("✓ All done!")
@@ -1513,10 +1545,20 @@ def run_gui():
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    _overlay_shown = [False]   # guard — only show once per session
+    _yt_meta_cache = [{}]      # stores last YouTube artist/title for lyrics fetch
+
     def _show_startup_overlay():
         """After Effects-style startup overlay: large logo, two-column layout."""
+        if _overlay_shown[0]:
+            return
+        _overlay_shown[0] = True
         # First-time setup: show setup screen if any required tool is missing
-        if not (_find_exe("yt-dlp") and _find_exe("ffmpeg") and _find_exe("ffplay")):
+        def _whisper_installed():
+            import importlib.util
+            return importlib.util.find_spec("faster_whisper") is not None
+        if not (_find_exe("yt-dlp") and _find_exe("ffmpeg") and _find_exe("ffplay")) \
+                or not _whisper_installed():
             _show_setup_screen()
             return
 
@@ -1816,6 +1858,383 @@ def run_gui():
     file_field(files_left, 9, 0, vars_["art"], [("Images", "*.png *.jpg *.jpeg")])
     file_field(files_left, 9, 1, vars_["lyrics"], [("Lyrics", "*.txt *.lrc")], padx=(16, 0))
 
+    # ── Lyrics fetch + AI Timestamp buttons (below lyrics field) ─────
+    _lyr_btn_var = tk.StringVar(value="🎵 Get Lyrics & Timestamps")
+
+    def _do_fetch_lyrics():
+        """Search lrclib.net for synced (LRC) or plain lyrics using artist+title."""
+        # Prefer YouTube-sourced artist/title — more reliable than GP-derived field values
+        _yt = _yt_meta_cache[0]
+        artist = (_yt.get("artist") or vars_["artist"].get()).strip()
+        title  = (_yt.get("title")  or vars_["title"].get()).strip()
+        if not artist or not title:
+            return messagebox.showerror("Missing info",
+                "Fill in Artist and Title fields before fetching lyrics.")
+        out_dir = vars_["out"].get().strip()
+        if not out_dir:
+            return messagebox.showerror("Missing info",
+                "Set a Project Folder first so lyrics can be saved there.")
+
+        _lyr_btn_var.set("⏳ Searching…")
+        _lyr_btn.configure(state="disabled")
+
+        def _worker():
+            import urllib.request, urllib.parse, json, unicodedata
+            def _slug(s):
+                s = unicodedata.normalize("NFKD", s)
+                s = s.encode("ascii", "ignore").decode()
+                return s.strip()
+
+            base = "https://lrclib.net/api"
+            found_lrc  = None
+            found_plain = None
+
+            # ── lrclib.net (synced LRC preferred) ──────────────────
+            def _lrc_pick(hits_list):
+                _s, _p = None, None
+                for h in hits_list:
+                    if h.get("syncedLyrics") and not _s: _s = h["syncedLyrics"]
+                    if h.get("plainLyrics")  and not _p: _p = h["plainLyrics"]
+                return _s, _p
+
+            def _fuzzy_score(search_title, hit_title):
+                """Score based on word overlap — prefix match handles GP truncations (deca→decay)."""
+                sw = _slug(search_title).lower().split()
+                hw = set(_slug(hit_title).lower().split())
+                score = 0
+                for w in sw:
+                    if w in hw or any(h.startswith(w) or w.startswith(h) for h in hw):
+                        score += 1
+                return score
+
+            try:
+                # Pass 1 — exact artist + title
+                q1 = urllib.parse.urlencode({
+                    "artist_name": _slug(artist),
+                    "track_name":  _slug(title),
+                })
+                with urllib.request.urlopen(base + "/search?" + q1, timeout=15) as r:
+                    found_lrc, found_plain = _lrc_pick(json.loads(r.read()))
+
+                # Pass 2 — keyword: artist + title
+                if not found_lrc and not found_plain:
+                    q2 = urllib.parse.urlencode({"q": _slug(artist) + " " + _slug(title)})
+                    with urllib.request.urlopen(base + "/search?" + q2, timeout=15) as r:
+                        found_lrc, found_plain = _lrc_pick(json.loads(r.read()))
+
+                # Pass 3 — artist + raw YouTube video title (strips "[Official Video]" etc.)
+                _raw = _yt_meta_cache[0].get("raw_title", "")
+                import re as _re_lrc
+                _clean_raw = _re_lrc.sub(r"[\[\(][^\]\)]*[\]\)]", "", _raw).strip(" -|")
+                if not found_lrc and not found_plain and _clean_raw and _clean_raw != title:
+                    q3 = urllib.parse.urlencode({"q": _slug(artist) + " " + _slug(_clean_raw)})
+                    with urllib.request.urlopen(base + "/search?" + q3, timeout=15) as r:
+                        found_lrc, found_plain = _lrc_pick(json.loads(r.read()))
+                    if found_lrc or found_plain:
+                        log("  [lyrics] matched via raw video title: " + _clean_raw)
+
+                # Pass 4 — artist-only search, pick best fuzzy title match
+                if not found_lrc and not found_plain:
+                    q4 = urllib.parse.urlencode({"q": _slug(artist)})
+                    with urllib.request.urlopen(base + "/search?" + q4, timeout=15) as r:
+                        all_hits = json.loads(r.read())
+                    best_score, best_hit = 0, None
+                    for h in all_hits:
+                        sc = _fuzzy_score(title, h.get("trackName", ""))
+                        if sc > best_score:
+                            best_score, best_hit = sc, h
+                    if best_hit and best_score >= 2:
+                        found_lrc, found_plain = _lrc_pick([best_hit])
+                        log("  [lyrics] fuzzy match: " + best_hit.get("trackName",""))
+
+            except Exception as _lrc_e:
+                log("  [lyrics] lrclib.net failed: " + str(_lrc_e) + " — trying lyrics.ovh")
+
+            # ── lyrics.ovh fallback (plain text) ────────────────────────
+            if not found_lrc and not found_plain:
+                try:
+                    _ovh_url = ("https://api.lyrics.ovh/v1/"
+                                + urllib.parse.quote(_slug(artist)) + "/"
+                                + urllib.parse.quote(_slug(title)))
+                    with urllib.request.urlopen(_ovh_url, timeout=15) as r:
+                        _ovh_data = json.loads(r.read())
+                    if _ovh_data.get("lyrics"):
+                        found_plain = _ovh_data["lyrics"]
+                        log("  [lyrics] Got plain lyrics from lyrics.ovh")
+                except Exception as _ovh_e:
+                    log("  [lyrics] lyrics.ovh also failed: " + str(_ovh_e))
+
+            if not found_lrc and not found_plain:
+                root.after(0, lambda: messagebox.showinfo(
+                    "Not found",
+                    "No lyrics found for:\n" + artist + " — " + title + "\n\n"
+                    "Both lrclib.net and lyrics.ovh were tried.\n"
+                    "Paste lyrics into a .txt file and set it in the Lyrics field."))
+                root.after(0, lambda: _lyr_btn_var.set("🔍 Fetch Lyrics"))
+                root.after(0, lambda: _lyr_btn.configure(state="normal"))
+                return
+
+            # Save to per-song subfolder (same structure as automagic download)
+            def _sfn(s): return re.sub(r"[^\w\- ]", "", s).strip().replace(" ", "_")[:40]
+            _sk = _sfn(artist) + "_" + _sfn(title)
+            song_dir = os.path.join(out_dir, _sk)
+            os.makedirs(song_dir, exist_ok=True)
+
+            if found_lrc:
+                dest = os.path.join(song_dir, _sk + ".lrc")
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(found_lrc)
+                root.after(0, lambda d=dest: vars_["lyrics"].set(d))
+                root.after(0, lambda: _lyr_btn_var.set("✓ Synced LRC — done!"))
+                root.after(0, lambda: _lyr_btn.configure(state="normal"))
+                log("  [lyrics] ✓ Synced LRC saved → " + dest)
+            else:
+                # Plain text only — save it then auto-run Whisper
+                dest = os.path.join(song_dir, _sk + "_lyrics.txt")
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(found_plain)
+                root.after(0, lambda d=dest: vars_["lyrics"].set(d))
+                log("  [lyrics] Plain lyrics saved → " + dest)
+                root.after(0, lambda: _lyr_btn_var.set("🎙 Adding timestamps…"))
+                root.after(200, _do_ai_timestamps)   # auto-chain into Whisper
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    _lyr_btn = tk.Button(files_left, textvariable=_lyr_btn_var,
+                         font=("Segoe UI", 8), relief="flat", bd=0, padx=8, pady=3,
+                         cursor="hand2", bg=COL["card2"], fg=COL["muted"],
+                         activebackground=COL["border_hi"], command=_do_fetch_lyrics)
+    _lyr_btn.grid(row=10, column=1, sticky="w", padx=(16, 0), pady=(0, 2))
+
+    _ts_btn_var = tk.StringVar(value="🎙 Get AI Timestamps")
+
+    def _do_ai_timestamps():
+        """Run faster-whisper on current audio, align with existing lyrics, write .lrc."""
+        # Prevent the startup splash from appearing mid-install
+        _overlay_shown[0] = True
+        try:
+            startup_overlay.place_forget()
+        except Exception:
+            pass
+
+        audio_path  = vars_["audio"].get()
+        lyrics_path = vars_["lyrics"].get()
+        if not audio_path or not os.path.isfile(audio_path):
+            return messagebox.showerror("No Audio", "Set an audio (.wav/.mp3/.ogg) file first.")
+        _audio_exts = ('.wav', '.mp3', '.ogg', '.flac', '.m4a', '.aac', '.opus')
+        if not audio_path.lower().endswith(_audio_exts):
+            return messagebox.showerror(
+                "Wrong file type",
+                f"The AUDIO field points to a non-audio file:\n{audio_path}\n\n"
+                "Set it to a .wav, .mp3, or .ogg file.")
+        if not lyrics_path or not os.path.isfile(lyrics_path):
+            return messagebox.showerror("No Lyrics", "Set a lyrics (.txt) file first.")
+
+        _ts_btn_var.set("⏳ Working…")
+        _ts_btn.configure(state="disabled")
+
+        def _status(msg):
+            root.after(0, lambda m=msg: _ts_btn_var.set(m))
+            root.after(0, lambda m=msg: log("  [whisper] " + m))
+
+        def _worker():
+            try:
+                # 1. Import faster-whisper — auto-install via CMD window if missing
+                _status("Loading Whisper…")
+                _fw = None
+                try:
+                    import faster_whisper as _fw
+                except ImportError:
+                    # Open a visible CMD window so the user can watch pip install
+                    _status("⏳ Installing faster-whisper… (watch CMD window)")
+                    try:
+                        subprocess.Popen(
+                            ["cmd", "/K",
+                             "echo Installing faster-whisper for RS Studio... && "
+                             "py -m pip install faster-whisper || "
+                             "python -m pip install faster-whisper && "
+                             "echo. && echo Done! You can close this window."],
+                            creationflags=subprocess.CREATE_NEW_CONSOLE
+                        )
+                    except Exception as _ie:
+                        root.after(0, lambda: messagebox.showerror(
+                            "Install failed",
+                            f"Could not open CMD:\n{_ie}\n\n"
+                            "Please run:  pip install faster-whisper  manually."))
+                        root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
+                        root.after(0, lambda: _ts_btn.configure(state="normal"))
+                        return
+                    # Poll every 3 s until importable (max ~3 min)
+                    import importlib, time as _time, sys as _sys
+                    for _attempt in range(60):
+                        _time.sleep(3)
+                        importlib.invalidate_caches()
+                        for _k in list(_sys.modules.keys()):
+                            if "faster_whisper" in _k:
+                                del _sys.modules[_k]
+                        try:
+                            import faster_whisper as _fw
+                            break
+                        except ImportError:
+                            _status(f"⏳ Waiting for install… ({(_attempt+1)*3}s)")
+                    if _fw is None:
+                        root.after(0, lambda: messagebox.showwarning(
+                            "Not installed yet",
+                            "faster-whisper still not found.\n"
+                            "Make sure the CMD window finished, then click again."))
+                        root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
+                        root.after(0, lambda: _ts_btn.configure(state="normal"))
+                        return
+
+                # 2. Load model — GPU if available, CPU fallback
+                model_dir = os.path.join(_get_tools_dir(), "whisper_models")
+                os.makedirs(model_dir, exist_ok=True)
+                _status("Loading Whisper model…")
+                try:
+                    model = _fw.WhisperModel("tiny", device="cuda",
+                                             compute_type="float16", download_root=model_dir)
+                    log("  [whisper] Using GPU (CUDA)")
+                except Exception:
+                    try:
+                        model = _fw.WhisperModel("tiny", device="cuda",
+                                                 compute_type="int8", download_root=model_dir)
+                        log("  [whisper] Using GPU (CUDA int8)")
+                    except Exception:
+                        model = _fw.WhisperModel("tiny", device="cpu",
+                                                 compute_type="int8", download_root=model_dir)
+                        log("  [whisper] GPU unavailable — using CPU")
+
+                # 3. Transcribe with word timestamps
+                _status("Transcribing audio… (30–90 sec, check Log)")
+                segments_gen, _ = model.transcribe(audio_path, word_timestamps=True,
+                                                language="en", beam_size=1,
+                                                vad_filter=True, vad_parameters={"min_silence_duration_ms": 300})
+                all_words = []
+                for seg in segments_gen:
+                    for w in (seg.words or []):
+                        all_words.append((w.start, w.word.strip()))
+
+                if not all_words:
+                    root.after(0, lambda: messagebox.showerror(
+                        "No speech detected", "Whisper found no words — check the audio file."))
+                    root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
+                    root.after(0, lambda: _ts_btn.configure(state="normal"))
+                    return
+
+                # 4. Load lyric lines
+                import re as _re3
+                with open(lyrics_path, "r", encoding="utf-8") as f:
+                    raw_lines = f.readlines()
+
+                # Filter: strip LRC tags, metadata credits, blank lines
+                _meta_pat = _re3.compile(
+                    r"^(source|songwriters?|writers?|composers?|lyrics?)\s*[:\.]",
+                    _re3.IGNORECASE)
+                _tag_pat  = _re3.compile(r"^\[.{0,40}\]$")
+                raw_plain = []
+                for l in raw_lines:
+                    l = l.strip()
+                    if not l: continue
+                    if _tag_pat.match(l): continue
+                    if _meta_pat.match(l): continue
+                    raw_plain.append(l)
+
+                # Split very long lines (>12 words) at punctuation so alignment works
+                def _split_long(line, max_words=12):
+                    words = line.split()
+                    if len(words) <= max_words:
+                        return [line]
+                    # Try splitting at punctuation boundaries
+                    chunks, cur = [], []
+                    for w in words:
+                        cur.append(w)
+                        if len(cur) >= max_words and w[-1] in ".,!?;":
+                            chunks.append(" ".join(cur)); cur = []
+                    # Force-split whatever's left by max_words
+                    if cur:
+                        while len(cur) > max_words:
+                            chunks.append(" ".join(cur[:max_words])); cur = cur[max_words:]
+                        if cur:
+                            chunks.append(" ".join(cur))
+                    return chunks if chunks else [line]
+
+                plain_lines = []
+                for l in raw_plain:
+                    plain_lines.extend(_split_long(l))
+
+                if not plain_lines:
+                    root.after(0, lambda: messagebox.showerror(
+                        "Empty lyrics", "No lyric lines found in file."))
+                    root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
+                    root.after(0, lambda: _ts_btn.configure(state="normal"))
+                    return
+
+                log(f"  [whisper] {len(plain_lines)} lyric lines to align")
+
+                # 5. Align each lyric line to transcribed words (greedy sliding window)
+                _status("Aligning lyrics to timestamps…")
+
+                def _cw(s):
+                    return _re3.sub(r"[^a-z0-9]", " ", s.lower()).split()
+
+                flat = [(t, tok) for (t, w) in all_words for tok in _cw(w)]
+                lrc_pairs = []
+                search_from = 0
+                for line in plain_lines:
+                    lw = _cw(line)
+                    if not lw:
+                        continue
+                    n = len(lw)
+                    best_score, best_pos = -1, search_from
+                    # Search window: don't let n push limit below search_from
+                    limit = max(search_from + 1, len(flat) - n + 1)
+                    for i in range(search_from, min(limit, len(flat))):
+                        avail = len(flat) - i
+                        window = [flat[i + j][1] for j in range(min(n, avail))]
+                        score  = sum(1 for a, b in zip(window, lw) if a == b)
+                        if score > best_score:
+                            best_score, best_pos = score, i
+                            if score == n:
+                                break
+                    if best_pos < len(flat):
+                        lrc_pairs.append((flat[best_pos][0], line))
+                        search_from = best_pos + max(1, n // 2)
+
+                if not lrc_pairs:
+                    root.after(0, lambda: messagebox.showerror(
+                        "No match", "Could not align lyrics — vocals may be unclear."))
+                    root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
+                    root.after(0, lambda: _ts_btn.configure(state="normal"))
+                    return
+
+                # 6. Write .lrc alongside the .txt
+                # Apply a small calibration offset: Whisper word.start tends to lag
+                # behind the actual vocal onset by ~0.15 s.
+                WHISPER_CALIB = 0.15
+                lrc_dest = os.path.splitext(lyrics_path)[0] + ".lrc"
+                with open(lrc_dest, "w", encoding="utf-8") as f:
+                    for (t, txt) in lrc_pairs:
+                        t2 = max(0.0, t - WHISPER_CALIB)
+                        m2 = int(t2) // 60
+                        s2 = t2 - m2 * 60
+                        f.write(f"[{m2:02d}:{s2:05.2f}]{txt}\n")
+
+                root.after(0, lambda: vars_["lyrics"].set(lrc_dest))
+                root.after(0, lambda: _ts_btn_var.set(f"✓ {len(lrc_pairs)} lines timestamped"))
+                root.after(0, lambda: _ts_btn.configure(state="normal"))
+                log(f"  [whisper] ✓ Saved {lrc_dest}")
+
+            except Exception as _e:
+                import traceback as _tb2
+                root.after(0, lambda: messagebox.showerror("Whisper error", str(_e)))
+                root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
+                root.after(0, lambda: _ts_btn.configure(state="normal"))
+                log(f"  [whisper] Error: {_e}\n{_tb2.format_exc()}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+
+
     # Video preview panel (top-right)
     main_vid_container = styled(tk.Frame(files_right, highlightthickness=1, width=320, height=180), bg="field", highlightbackground="border")
     main_vid_container.pack(anchor="n"); main_vid_container.pack_propagate(False)
@@ -1914,6 +2333,7 @@ def run_gui():
     styled(tk.Label(meta_card, text="Blank gap before the song starts (Rocksmith needs ~5s to load). Fine-tune in Sync & Verify.", font=("Segoe UI", 8), justify="left", wraplength=300), fg="dim", bg="card").grid(row=7, column=0, sticky="w", pady=(2, 0))
     styled(tk.Label(meta_card, text="Auto-detected from the GP file's tempo map. Edit if it's wrong, or click ↺ to re-detect.", font=("Segoe UI", 8), justify="left", wraplength=300), fg="dim", bg="card").grid(row=7, column=1, sticky="w", padx=(12, 0), pady=(2, 0))
 
+
     # --- SECTION 3: ARRANGEMENTS ---
     section_header(content, "Arrangements & Tones")
     arr_card = make_card(content)
@@ -1959,7 +2379,7 @@ def run_gui():
     # ══════════════════════════════════════════════════════════════════════
     slop_page = styled(tk.Frame(page_container), bg="surface")
     pages["audioeditor"] = slop_page
-    page_header(slop_page, "Audio Editor  —  Sync Tuner")
+    page_header(slop_page, "Slopsmith  —  Sync Tuner")
 
     # ── waveform state ────────────────────────────────────────────────────
     _wf_state = {
@@ -3303,21 +3723,29 @@ def run_gui():
         sv_scrub.create_text(cw - PAD + 6, MID, text=_fmt(dur), anchor="w",
                              fill=COL["dim"], font=("Segoe UI", 8))
 
-    def _sv_scrub_seek(event):
+    _scrub_drag = {"was_playing": False}
+
+    def _sv_scrub_press(event):
+        _scrub_drag["was_playing"] = _sv["t0"] is not None
+        if _scrub_drag["was_playing"]: _sv_stop()
+
+    def _sv_scrub_move(event):
         dur = _sv["audio_dur"]
         if dur <= 0: return
         cw  = max(sv_scrub.winfo_width(), 1)
         PAD = 64
         frac = max(0.0, min(1.0, (event.x - PAD) / max(1, cw - PAD * 2)))
-        was_playing = _sv["t0"] is not None
-        if was_playing: _sv_stop()
         _sv["offset"] = frac * dur
         _sv_draw_scrubber()
         _sv_draw_tab()
-        if was_playing: root.after(60, _sv_play)
 
-    sv_scrub.bind("<Button-1>", _sv_scrub_seek)
-    sv_scrub.bind("<B1-Motion>",  _sv_scrub_seek)
+    def _sv_scrub_release(event):
+        _sv_scrub_move(event)
+        if _scrub_drag["was_playing"]: root.after(60, _sv_play)
+
+    sv_scrub.bind("<Button-1>",       _sv_scrub_press)
+    sv_scrub.bind("<B1-Motion>",      _sv_scrub_move)
+    sv_scrub.bind("<ButtonRelease-1>", _sv_scrub_release)
     sv_scrub.bind("<Configure>",  lambda e: _sv_draw_scrubber())
 
     # ── tab canvas ────────────────────────────────────────────────────────
@@ -3421,25 +3849,32 @@ def run_gui():
             _sv["after_id"] = root.after(80, _sv_tick)
 
     # ── canvas events ─────────────────────────────────────────────────────
-    def _sv_seek(event):
+    _tab_drag = {"was_playing": False, "anchor_x": 0, "anchor_t": 0.0}
+
+    def _sv_tab_press(event):
+        _tab_drag["was_playing"] = _sv["t0"] is not None
+        _tab_drag["anchor_x"] = event.x
+        _tab_drag["anchor_t"] = _sv_elapsed()
+        if _tab_drag["was_playing"]: _sv_stop()
+
+    def _sv_tab_move(event):
         dur = _sv["audio_dur"]
         if dur <= 0: return
         cw  = max(sv_tab.winfo_width(), 1)
-        px  = cw * AHEAD
         pps = cw / VIEW_SEC
-        t   = _sv_elapsed() + (event.x - px) / pps
+        t   = _tab_drag["anchor_t"] + (event.x - _tab_drag["anchor_x"]) / pps
         t   = max(0.0, min(t, dur))
-        was_playing = _sv["t0"] is not None
-        if was_playing:
-            _sv_stop()
         _sv["offset"] = t
         _sv_draw_scrubber()
         _sv_draw_tab()
-        if was_playing:
-            root.after(60, _sv_play)
 
-    sv_tab.bind("<Button-1>",  _sv_seek)
-    sv_tab.bind("<B1-Motion>", _sv_seek)
+    def _sv_tab_release(event):
+        _sv_tab_move(event)
+        if _tab_drag["was_playing"]: root.after(60, _sv_play)
+
+    sv_tab.bind("<Button-1>",       _sv_tab_press)
+    sv_tab.bind("<B1-Motion>",      _sv_tab_move)
+    sv_tab.bind("<ButtonRelease-1>", _sv_tab_release)
     sv_tab.bind("<Configure>", lambda e: _sv_draw_tab())
 
     # ── note/bar parsing ──────────────────────────────────────────────────
@@ -3504,7 +3939,11 @@ def run_gui():
                             m = _re.match(r"\[(\d+):(\d+\.\d+)\](.*)", line.strip())
                             if m:
                                 t = int(m.group(1)) * 60 + float(m.group(2))
-                                lrc.append((t, m.group(3).strip()))
+                                try:
+                                    t += float(vars_["lrc_offset"].get() or 0.0)
+                                except Exception:
+                                    pass
+                                lrc.append((max(0.0, t), m.group(3).strip()))
                         lrc.sort(key=lambda x: x[0])
                         # No timestamps found — spread lines evenly across the song
                         if not lrc:
@@ -3610,6 +4049,89 @@ def run_gui():
         _sv["track_leadins"][ti] = nv
         sv_leadin_var.set(f"{nv:.2f}")
         _sv_reparse_notes()
+
+    # ── lyrics offset nudge ──────────────────────────────────────────────
+    sv_lrc_row = styled(tk.Frame(sync_page), bg="surface")
+    sv_lrc_row.pack(anchor="center", pady=(0, 6))
+
+    styled(tk.Label(sv_lrc_row, text="Lyrics offset:", font=("Segoe UI", 9)),
+           fg="muted", bg="surface").pack(side="left", padx=(0, 8))
+
+    def _sv_lrc_nudge(delta):
+        cur = float(vars_["lrc_offset"].get() or 0.0)
+        nv = round(cur + delta, 2)
+        vars_["lrc_offset"].set(f"{nv:.2f}")
+        sign = "+" if nv >= 0 else ""
+        sv_lrc_val_var.set(f"{sign}{nv:.2f}")
+        # Re-parse LRC with new offset so the preview updates immediately
+        _sv_reload_lrc()
+
+    def _sv_reload_lrc():
+        """Re-read the LRC file applying current lrc_offset, refresh Sync tab display."""
+        lrc_path = vars_["lyrics"].get()
+        if not lrc_path or not os.path.isfile(lrc_path):
+            return
+        import re as _re
+        lrc = []
+        try:
+            with open(lrc_path, "r", encoding="utf-8") as f:
+                raw_lines = f.readlines()
+            for line in raw_lines:
+                m = _re.match(r"\[(\d+):(\d+\.\d+)\](.*)", line.strip())
+                if m:
+                    t = int(m.group(1)) * 60 + float(m.group(2))
+                    try:
+                        t += float(vars_["lrc_offset"].get() or 0.0)
+                    except Exception:
+                        pass
+                    lrc.append((max(0.0, t), m.group(3).strip()))
+            lrc.sort(key=lambda x: x[0])
+            # Plain-text fallback: spread lines evenly (same as main load path)
+            if not lrc:
+                plain = [l.strip() for l in raw_lines
+                         if l.strip() and not _re.match(r"^\[.{0,40}\]$", l.strip())]
+                _d = _sv["audio_dur"] if _sv["audio_dur"] > 0 else 240.0
+                try: leadin = float(vars_["leadin"].get() or 5)
+                except: leadin = 5.0
+                lrc_off = 0.0
+                try: lrc_off = float(vars_["lrc_offset"].get() or 0.0)
+                except: pass
+                usable = max(10.0, _d - leadin - 5.0)
+                step = max(1.0, usable / max(1, len(plain)))
+                for i, txt in enumerate(plain):
+                    lrc.append((max(0.0, leadin + i * step + lrc_off), txt))
+            if lrc:  # only overwrite if we actually parsed something
+                _sv["lrc"] = lrc
+            _sv_update_lyric()
+        except Exception:
+            pass
+
+    for (_d, _lbl) in [(-1.0, "◀ 1s"), (-0.1, "◀ 0.1s"), (-0.05, "◀ 0.05s")]:
+        tk.Button(sv_lrc_row, text=_lbl, font=("Segoe UI", 9), relief="flat", bd=0,
+                  padx=8, pady=4, cursor="hand2",
+                  bg=COL["card"], fg=COL["fg"], activebackground=COL["card2"],
+                  command=lambda d=_d: _sv_lrc_nudge(d)).pack(side="left", padx=2)
+
+    sv_lrc_val_var = tk.StringVar(value="+0.00")
+    styled(tk.Label(sv_lrc_row, textvariable=sv_lrc_val_var,
+                    font=("Segoe UI Semibold", 11), width=7),
+           fg="accent", bg="surface").pack(side="left", padx=8)
+
+    for (_d, _lbl) in [(0.05, "0.05s ▶"), (0.1, "0.1s ▶"), (1.0, "1s ▶")]:
+        tk.Button(sv_lrc_row, text=_lbl, font=("Segoe UI", 9), relief="flat", bd=0,
+                  padx=8, pady=4, cursor="hand2",
+                  bg=COL["card"], fg=COL["fg"], activebackground=COL["card2"],
+                  command=lambda d=_d: _sv_lrc_nudge(d)).pack(side="left", padx=2)
+
+    def _sv_reset_lrc():
+        vars_["lrc_offset"].set("0.00")
+        sv_lrc_val_var.set("+0.00")
+        _sv_reload_lrc()
+
+    tk.Button(sv_lrc_row, text="↺ Reset", font=("Segoe UI", 9), relief="flat", bd=0,
+              padx=10, pady=4, cursor="hand2",
+              bg=COL["card2"], fg=COL["muted"], activebackground=COL["border_hi"],
+              command=_sv_reset_lrc).pack(side="left", padx=(16, 2))
 
     # ── action row ────────────────────────────────────────────────────────
     sv_act = styled(tk.Frame(sync_page), bg="surface")
@@ -3802,76 +4324,76 @@ def run_gui():
     tk.Frame(help_inner, height=20, bg=COL["surface"]).pack()
 
     _help_section("Step 1 — Load a Guitar Pro File", [
-        "RS Studio starts with a Guitar Pro (.gp / .gp5) file that contains your song's notes and tempo map.",
+        "RS Studio starts with a Guitar Pro (.gp) file that contains the song's notes and tempo map.",
         "",
-        "• Click  ＋ Start New Project  on the splash screen to get to the Main page.",
-        "• Drag and drop a .gp file onto the GP File field, or click Browse to find it.",
-        "• RS Studio will automatically read the title, artist, and BPM from the file.",
+        "• Click  + Start New Project  on the splash screen, or drag a .gp file directly onto the window.",
+        "• RS Studio reads the title, artist, BPM, and track layout from the file automatically.",
+        "• Non-guitar tracks (drums, saxophone, piano, etc.) are filtered out — only guitar and bass appear.",
     ])
 
     _help_section("Step 2 — Auto-Fetch Audio & Artwork", [
-        "You need an audio file (.ogg or .wav) and album art (.png / .jpg) to build a CDLC.",
+        "You need an audio file and album art to build a CDLC. RS Studio can grab both automatically.",
         "",
-        "• Click  Auto-Fetch  next to the Audio URL field. RS Studio will search YouTube for the song and download audio automatically using yt-dlp.",
-        "• If the wrong song is found, paste a direct YouTube URL into the Audio URL box first.",
-        "• Album art is fetched from MusicBrainz / Cover Art Archive automatically. You can also drag your own image onto the Art field.",
-        "• The bottom player bar shows the loaded song — press  ▶  to preview the audio.",
+        "• Paste a YouTube URL into the Audio URL field and click  Auto-Fetch.",
+        "• RS Studio downloads the audio, reads the video title to correct artist/song info, fetches album art from iTunes, and fetches synced lyrics — all without any extra clicks.",
+        "• If the wrong video is found, paste a direct YouTube link before clicking Auto-Fetch.",
+        "• You can also drag your own audio file (.wav/.ogg/.mp3) and album art image onto the fields.",
     ])
 
-    _help_section("Step 3 — Review Settings (Main Page)", [
+    _help_section("Step 3 — Lyrics & Timestamps", [
+        "RS Studio can generate synced lyrics for your CDLC automatically using AI.",
+        "",
+        "• After Auto-Fetch, lyrics are downloaded from lrclib.net and AI timestamps are generated with Whisper — no clicking needed.",
+        "• If timestamps feel slightly early or late, use the  Lyrics offset  slider in Sync & Verify to nudge them.",
+        "• Drag left (−) to make lyrics appear earlier, drag right (+) to delay them. Click  ↺  to reset.",
+        "• To re-run AI timestamps manually, click  🎙 Get Lyrics & Timestamps  on the Main page.",
+    ])
+
+    _help_section("Step 4 — Review Settings (Main Page)", [
         "Before building, check these key settings:",
         "",
-        "• Title / Artist / Album / Year — filled automatically from the .gp file. Edit if needed.",
-        "• Lead-in (seconds) — silent gap before notes start. Default 5s is fine for most songs.",
-        "• Volume — negative dB value. Default -8 dB. Lower = quieter in-game.",
-        "• Scroll Speed — how fast the note highway scrolls. Higher = faster. Tune in the Audio Editor.",
-        "• Output Folder — where the project files are saved. Defaults to RS Studio Projects/ next to the app.",
-        "• PSARC Output — optional: where the final .psarc file is copied after building.",
+        "• Title / Artist / Album / Year — filled automatically. Edit if anything looks wrong.",
+        "• Song Delay (seconds) — silent gap before notes start. Default 5s is fine for most songs.",
+        "• Volume — negative dB value. Default -8 dB. Lower numbers = quieter in-game.",
+        "• Arrangements — check which tracks are set to Lead, Rhythm, or Bass. Uncheck any you don't want.",
+        "• Output Folder — where project files are saved.",
     ])
 
-    _help_section("Step 4 — Tune Timing (Audio Editor)", [
-        "If the notes feel early or late when you play, use the Audio Editor to fix sync.",
+    _help_section("Step 5 — Tune Timing (Sync & Verify)", [
+        "If notes feel early or late when playing, use Sync & Verify to fix it.",
         "",
-        "• The Sync Tuner shows BPM and a stretch slider. The GP file's tempo map drives note timing.",
-        "• Use  Auto BPM  to detect BPM from the audio file if it differs from the GP file.",
-        "• Stretch Audio to GP Length adjusts audio speed so it matches the note map exactly.",
-        "• Click  ▶ Launch Desktop App  to open Slopsmith in your browser for a quick visual check.",
+        "• The tab canvas shows your notes scrolling against the audio in real time — press  ▶ Play  to start.",
+        "• Click or drag the timeline to seek. The scrubber at the top shows your position in the song.",
+        "• Use  Track leadin  nudge buttons (◀ / ▶) to shift the entire note chart earlier or later.",
+        "• Click  Apply to build →  when the timing feels right — this saves the leadin to your build settings.",
+        "• Use the  Lyrics offset  slider to shift lyrics independently of the notes.",
+        "• BPM scale stretches or compresses the note chart if the GP file tempo doesn't match the audio.",
     ])
 
-    _help_section("Step 5 — Build the CDLC", [
-        "Click  ▶ Create CDLC  in the bottom-left of the sidebar.",
+    _help_section("Step 6 — Build the CDLC", [
+        "Click  ✓ Build & Export PSARC  in the Sync & Verify page, or  ⚡ Build  on the Main page.",
         "",
-        "• RS Studio runs the full build pipeline: converts audio, generates .xml chart data, packages everything into a .psarc file.",
-        "• Progress is logged on the Log page (≡ in the sidebar).",
-        "• When done, a dialog shows the output path and Windows Explorer opens to the file.",
-        "• The built project also appears in the splash screen's Recent Projects list next time.",
-    ])
-
-    _help_section("Step 6 — Verify in Slopsmith", [
-        "Slopsmith is a Rocksmith-compatible gameplay engine you can use to see and hear your CDLC before loading it in the actual game. You need to build the CDLC (Step 5) first — Slopsmith reads the .psarc file.",
-        "",
-        "• Go to the  Slopsmith  tab in the sidebar.",
-        "• Click  ▶ Launch & Embed Slopsmith — the app launches and embeds inside RS Studio after a few seconds.",
-        "• In Slopsmith, open your .psarc file from the library.",
-        "• Start a session and watch the 3D note highway. If notes are mis-timed, go back to the Audio Editor and adjust.",
-        "• Click  ⤢ Detach to Window  to pop Slopsmith back out as its own window if needed.",
+        "• RS Studio converts audio, generates chart XML, and packages everything into a .psarc file.",
+        "• Progress is shown in a popup window while the build runs.",
+        "• When done, find your .psarc in the Output Folder you set on the Main page.",
     ])
 
     _help_section("Step 7 — Install in Rocksmith", [
-        "Once you're happy with the CDLC, copy the .psarc file into your Rocksmith DLC folder.",
+        "Copy the .psarc file into your Rocksmith DLC folder.",
         "",
         "• Default Rocksmith DLC path:  Steam\\steamapps\\common\\Rocksmith2014\\dlc\\",
         "• Launch Rocksmith 2014 Remastered — the song appears in Learn a Song.",
-        "• If it doesn't show up, check that your game has the D3DX9 fix / CDLC enabler installed.",
+        "• If it doesn't show up, make sure you have the CDLC enabler (D3DX9 patch) installed.",
     ])
 
     _help_section("Tips & Troubleshooting", [
-        "• No audio after auto-fetch? Make sure yt-dlp.exe and ffmpeg.exe are in the same folder as the app.",
-        "• Build failed? Check the Log page for the exact error. Common causes: missing packer.exe path, bad audio format, or GP file with unsupported features.",
-        "• Slopsmith won't embed? Give it 10–20 seconds after clicking Launch. Click  ↺ Re-embed  if needed.",
+        "• No audio after Auto-Fetch? Make sure yt-dlp.exe and ffmpeg.exe are in the same folder as the app.",
+        "• Build failed? Check the Log page for the exact error. Common causes: missing packer path, bad audio format, or no arrangements selected.",
+        "• Lyrics not showing in-game? Make sure the .lrc file path is set in the Lyrics field on the Main page.",
         "• Wrong song fetched from YouTube? Paste a direct YouTube link into Audio URL before clicking Auto-Fetch.",
         "• Volume too loud in-game? Lower the Volume field (e.g. -12 instead of -8) and rebuild.",
-        "• Change theme colors anytime via the  ◐ Theme  tab — your accent color is saved.",
+        "• AI timestamps require faster-whisper — RS Studio installs it automatically on first use.",
+        "• Change theme colors anytime via the  ◐ Theme  tab — your accent color is saved between sessions.",
     ])
 
     tk.Frame(help_inner, height=40, bg=COL["surface"]).pack()
@@ -4147,6 +4669,7 @@ def run_gui():
                     "artist": yt_artist.strip(),
                     "track":  yt_track.strip(),
                     "year":   final_year,
+                    "title":  v_title,   # raw video title e.g. "THE PERFUME OF DECAY [OFFICIAL VIDEO]"
                 }
                 root.after(0, lambda: _build_inspector_ui(v_title, v_chan, v_dur, v_thumb))
             except Exception as e:
@@ -4316,10 +4839,38 @@ def run_gui():
                     vars_["year"].set(ym["year"])
                 elif vars_["year"].get() in ("", _this_year):
                     pass  # keep current-year default rather than clearing
-                if ym.get("artist") and vars_["artist"].get() in ("", "Unknown"):
-                    vars_["artist"].set(ym["artist"].title())
-                if ym.get("track") and vars_["title"].get() in ("", "Unknown"):
-                    vars_["title"].set(ym["track"].title())
+                # Only fill artist/title if not already set — keeps lrclib search clean
+                # Derive clean artist + title from YouTube metadata.
+                # YouTube Music structured fields are often wrong/truncated for regular YT videos,
+                # so we also parse the raw video title and pick whichever version is longer.
+                import re as _re_t
+                _raw_vt   = ym.get("title", "")
+                _clean_vt = _re_t.sub(r"[\[\(][^\]\)]*[\]\)]", "", _raw_vt).strip(" -|")
+                _vt_artist, _vt_title = "", ""
+                if " - " in _clean_vt:
+                    _vt_artist, _vt_title = [p.strip() for p in _clean_vt.split(" - ", 1)]
+
+                # Pick the LONGEST across: YouTube Music track tag, video-title parse, album-extracted title
+                _ym_artist = (ym.get("artist") or "").strip()
+                _ym_track  = (ym.get("track")  or "").strip()
+                _ym_album  = (ym.get("album")  or "").strip()
+                # Album often contains full title e.g. "The Perfume of Decay - Single" → extract it
+                _album_title = _re_t.sub(
+                    r'\s*[-–]\s*(Single|EP|Album|Deluxe.*|Remaster.*|Live.*|Acoustic.*)$',
+                    '', _ym_album, flags=_re_t.IGNORECASE).strip()
+                _yt_artist = (_ym_artist if len(_ym_artist) >= len(_vt_artist) else _vt_artist).title()
+                _title_candidates = [c for c in [_ym_track, _vt_title, _album_title] if c]
+                _yt_title = (max(_title_candidates, key=len) if _title_candidates else "").title()
+                if not _yt_artist: _yt_artist = (_ym_artist or _vt_artist).title()
+                if not _yt_title:  _yt_title  = (_ym_track  or _vt_title ).title()
+
+                # Always update UI fields from YouTube — more reliable than GP file metadata
+                if _yt_artist: vars_["artist"].set(_yt_artist)
+                if _yt_title:  vars_["title"].set(_yt_title)
+
+                # Cache for lrclib search — always use YouTube-sourced values, not GP metadata
+                _yt_meta_cache[0] = {"artist": _yt_artist, "title": _yt_title}
+
                 _close()
                 _trigger_automagic(v_url)
 
@@ -4347,11 +4898,45 @@ def run_gui():
 
         # Per-song subfolder derived from artist + title
         def _safe_fn(s): return re.sub(r'[^\w\- ]', '', s).strip().replace(' ', '_')[:40]
-        _sk_artist = vars_["artist"].get().strip() or "Unknown"
-        _sk_title  = vars_["title"].get().strip()  or "Unknown"
+        # Prefer YouTube-sourced values (set by _confirm before _trigger_automagic)
+        # over GP file metadata which is often truncated or wrong
+        _yt_c = _yt_meta_cache[0]
+        _sk_artist = (_yt_c.get("artist") or vars_["artist"].get()).strip() or "Unknown"
+        _sk_title  = (_yt_c.get("title")  or vars_["title"].get()).strip()  or "Unknown"
         song_key  = f"{_safe_fn(_sk_artist)}_{_safe_fn(_sk_title)}"
         song_dir  = os.path.join(out_dir, song_key)
         os.makedirs(song_dir, exist_ok=True)
+
+        # Auto-fetch album art from iTunes if not already set
+        def _fetch_art():
+            if vars_["art"].get() and os.path.isfile(vars_["art"].get()):
+                return  # already have art
+            try:
+                import urllib.request, urllib.parse, json as _j
+                _q  = urllib.parse.quote(f"{_sk_artist} {_sk_title}")
+                _au = f"https://itunes.apple.com/search?term={_q}&media=music&limit=1&entity=song"
+                with urllib.request.urlopen(_au, timeout=10) as _r:
+                    _res = _j.loads(_r.read())
+                if _res.get("results"):
+                    _hit = _res["results"][0]
+                    _thumb = _hit.get("artworkUrl100", "")
+                    if _thumb:
+                        # Upgrade to 600x600
+                        _hires = _thumb.replace("100x100bb", "600x600bb")
+                        _art_path = os.path.join(song_dir, "cover.jpg")
+                        urllib.request.urlretrieve(_hires, _art_path)
+                        root.after(0, lambda p=_art_path: vars_["art"].set(p))
+                        log("  [art] ✓ Cover art downloaded from iTunes")
+                    # Auto-fill album name if still blank or generic
+                    _itunes_album = _hit.get("collectionName", "").strip()
+                    if _itunes_album:
+                        _cur_album = vars_["album"].get().strip()
+                        if not _cur_album or _cur_album.lower() in ("single", "unknown", ""):
+                            root.after(0, lambda a=_itunes_album: vars_["album"].set(a))
+                            log("  [art] ✓ Album: " + _itunes_album)
+            except Exception as _ae:
+                log("  [art] Art fetch failed: " + str(_ae))
+        threading.Thread(target=_fetch_art, daemon=True).start()
 
         ytdlp  = _find_exe("yt-dlp")
         ffmpeg = _find_exe("ffmpeg")
@@ -4374,7 +4959,8 @@ def run_gui():
         dl_card.lift()
 
         status_var2 = tk.StringVar(value="Starting download…")
-        tk.Label(dl_card, text="⬇  Downloading Audio", font=("Segoe UI Semibold", 12),
+        title_var2  = tk.StringVar(value="⬇  Downloading Audio")
+        tk.Label(dl_card, textvariable=title_var2, font=("Segoe UI Semibold", 12),
                  bg=COL["card"], fg=COL["fg"]).pack(pady=(20, 6))
         tk.Label(dl_card, textvariable=status_var2, font=("Segoe UI", 9),
                  bg=COL["card"], fg=COL["muted"], wraplength=360).pack()
@@ -4401,15 +4987,47 @@ def run_gui():
                         try: os.remove(os.path.join(dest_dir, f))
                         except Exception: pass
 
-                root.after(0, lambda: _safe_status("Running yt-dlp…"))
-                cmd = [ytdlp, "-x", "--audio-format", "wav",
-                       "--no-playlist", "--no-warnings"]
-                # Tell yt-dlp where bundled ffmpeg lives so wav conversion works
                 _ff = _find_exe("ffmpeg")
-                if _ff:
-                    cmd += ["--ffmpeg-location", os.path.dirname(_ff)]
-                cmd += ["-o", out_tmpl, confirmed_url]
-                proc = subprocess.run(cmd, capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=300)
+
+                # Always update yt-dlp before downloading — YouTube breaks old versions frequently
+                root.after(0, lambda: _safe_status("Updating yt-dlp…"))
+                try:
+                    subprocess.run([ytdlp, "-U"], capture_output=True,
+                                   creationflags=CREATE_NO_WINDOW, timeout=90)
+                except Exception:
+                    pass
+
+                def _run_ytdlp(client, fmt=None):
+                    c = [ytdlp, "-x", "--no-playlist", "--no-warnings"]
+                    if fmt:
+                        c += ["-f", fmt]
+                    if client:
+                        c += ["--extractor-args", f"youtube:player_client={client}"]
+                    if _ff:
+                        c += ["--ffmpeg-location", os.path.dirname(_ff)]
+                    c += ["-o", out_tmpl, confirmed_url]
+                    return subprocess.run(c, capture_output=True,
+                                          creationflags=CREATE_NO_WINDOW, timeout=300)
+
+                # Try strategies in order until one succeeds
+                _strategies = [
+                    ("ios",          "bestaudio/best"),
+                    ("web",          "bestaudio/best"),
+                    ("mweb",         "bestaudio/best"),
+                    (None,           "bestaudio/best"),
+                    (None,           None),
+                ]
+                proc = None
+                for _client, _fmt in _strategies:
+                    root.after(0, lambda c=_client: _safe_status(
+                        f"Downloading audio ({c or 'default'} client)…"))
+                    proc = _run_ytdlp(_client, _fmt)
+                    _stderr_txt = (proc.stderr or b"").decode("utf-8", errors="replace")
+                    if proc.returncode == 0:
+                        log(f"  [fetch] yt-dlp succeeded (client={_client}, fmt={_fmt})")
+                        break
+                    log(f"  [fetch] Strategy client={_client} fmt={_fmt} failed: "
+                        f"{_stderr_txt[-200:]}")
 
                 # Find the downloaded file — prefer .wav, accept any song_key file as fallback
                 raw_audio = None
@@ -4443,6 +5061,20 @@ def run_gui():
                     if not raw_audio or not os.path.exists(raw_audio):
                         raise Exception(f"yt-dlp finished but no audio file found.\n{err_detail}")
 
+                # Convert to WAV if needed (Rocksmith requires PCM WAV)
+                if raw_audio and not raw_audio.lower().endswith(".wav") and ffmpeg:
+                    root.after(0, lambda: _safe_status("Converting to WAV…"))
+                    wav_out = os.path.join(dest_dir, f"{song_key}.wav")
+                    conv = subprocess.run(
+                        [ffmpeg, "-y", "-i", raw_audio, "-ar", "48000",
+                         "-ac", "2", "-sample_fmt", "s16", wav_out],
+                        capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=120)
+                    if os.path.exists(wav_out):
+                        raw_audio = wav_out
+                        log(f"  [fetch] Converted to WAV: {wav_out}")
+                    else:
+                        log(f"  [fetch] WAV conversion failed, using original: {raw_audio}")
+
                 root.after(0, lambda: vars_["audio"].set(raw_audio))
                 log(f"  [fetch] Audio saved: {raw_audio}")
 
@@ -4464,12 +5096,15 @@ def run_gui():
 
                 # Fetch synced lyrics from lrclib.net
                 try:
-                    o_artist = vars_["artist"].get().strip()
-                    o_title  = vars_["title"].get().strip()
+                    # Use YouTube-sourced artist/title (cached in _confirm), not GP metadata
+                    _yt_cache = _yt_meta_cache[0]
+                    o_artist = (_yt_cache.get("artist") or vars_["artist"].get()).strip()
+                    o_title  = (_yt_cache.get("title")  or vars_["title"].get()).strip()
                     root.after(0, lambda: _safe_status("Fetching lyrics…"))
                     log(f"  [fetch] Looking up lyrics: artist='{o_artist}' title='{o_title}'")
                     _LRCLIB_HDR = {"User-Agent": "gp2rs-studio/2.0"}
                     synced_lrc = None
+                    _saved_txt_path = None   # track plain-text save so Whisper trigger is reliable
 
                     import difflib as _dl
                     def _fuzzy(a, b):
@@ -4478,14 +5113,23 @@ def run_gui():
                         return _dl.SequenceMatcher(None, _n(a), _n(b)).ratio()
 
                     def _lrc_best_match(results, artist, title):
-                        """Pick the best synced-lyrics result by fuzzy score."""
+                        """Pick the best synced-lyrics result.
+                        Name similarity is the primary key; among close matches,
+                        prefer whichever has the most lyrics (lines count)."""
                         best_score, best_item = 0.0, None
                         for item in results:
                             if not item.get("syncedLyrics"):
                                 continue
                             sc = (_fuzzy(item.get("artistName",""), artist) +
                                   _fuzzy(item.get("trackName",""), title))
-                            if sc > best_score:
+                            # Tiebreak: prefer more complete lyrics (more lines)
+                            cur_lines  = len((best_item or {}).get("syncedLyrics","").splitlines()) if best_item else 0
+                            this_lines = len(item["syncedLyrics"].splitlines())
+                            if sc > best_score + 0.1:
+                                # Clearly better name match — always prefer
+                                best_score, best_item = sc, item
+                            elif sc >= best_score - 0.1 and this_lines > cur_lines:
+                                # Similar name match but more lyrics — prefer this one
                                 best_score, best_item = sc, item
                         return best_item, best_score
 
@@ -4501,30 +5145,43 @@ def run_gui():
                             d = json.loads(r.read().decode("utf-8"))
                         if d.get("syncedLyrics"):
                             synced_lrc = d["syncedLyrics"]
-                            log("  [fetch] Lyrics found via exact-match endpoint")
+                            _exact_lines = len(synced_lrc.splitlines())
+                            log(f"  [fetch] Lyrics found via exact-match ({_exact_lines} lines)")
                         else:
                             log("  [fetch] Exact match found but no synced lyrics — trying search…")
                     except Exception as _e1:
                         log(f"  [fetch] Exact-match failed ({_e1}) — trying search…")
 
-                    # 2) Fallback: fuzzy search on lrclib
-                    if not synced_lrc:
-                        try:
-                            search_q = urllib.parse.quote(f"{o_artist} {o_title}")
-                            search_url = f"https://lrclib.net/api/search?q={search_q}"
-                            req2 = urllib.request.Request(search_url, headers=_LRCLIB_HDR)
-                            with urllib.request.urlopen(req2, timeout=10) as r2:
-                                results = json.loads(r2.read().decode("utf-8"))
-                            log(f"  [fetch] Search returned {len(results)} result(s)")
-                            best_item, best_score = _lrc_best_match(results, o_artist, o_title)
-                            if best_item and best_score >= 0.5:
+                    # 2) Search lrclib — always run to find the most complete version.
+                    # Also try title-only when artist may be wrong (bad yt-dlp metadata).
+                    _exact_lines = len(synced_lrc.splitlines()) if synced_lrc else 0
+                    def _lrc_search(q):
+                        url = f"https://lrclib.net/api/search?q={urllib.parse.quote(q)}"
+                        req = urllib.request.Request(url, headers=_LRCLIB_HDR)
+                        with urllib.request.urlopen(req, timeout=10) as r:
+                            return json.loads(r.read().decode("utf-8"))
+
+                    try:
+                        # Try artist+title first
+                        results = _lrc_search(f"{o_artist} {o_title}")
+                        log(f"  [fetch] Search (artist+title) returned {len(results)} result(s)")
+                        # If 0 results, retry with title only (artist metadata may be wrong)
+                        if not results:
+                            results = _lrc_search(o_title)
+                            log(f"  [fetch] Search (title-only) returned {len(results)} result(s)")
+                        best_item, best_score = _lrc_best_match(results, o_artist, o_title)
+                        if best_item and best_score >= 0.3:  # lower threshold for title-only fallback
+                            _search_lines = len(best_item["syncedLyrics"].splitlines())
+                            if _search_lines > _exact_lines:
                                 synced_lrc = best_item["syncedLyrics"]
-                                log(f"  [fetch] Best fuzzy match (score={best_score:.2f}): "
+                                log(f"  [fetch] Using search result ({_search_lines} lines, score={best_score:.2f}): "
                                     f"'{best_item.get('artistName','')} – {best_item.get('trackName','')}'")
                             else:
-                                log("  [fetch] No close-enough match in lrclib results")
-                        except Exception as _e2:
-                            log(f"  [fetch] Search also failed: {_e2}")
+                                log(f"  [fetch] Keeping exact-match ({_exact_lines} lines ≥ search {_search_lines})")
+                        else:
+                            log("  [fetch] No usable match in lrclib search")
+                    except Exception as _e2:
+                        log(f"  [fetch] lrclib search failed: {_e2}")
 
                     # 3) Fallback: Genius.com (plain text, no timestamps)
                     if not synced_lrc:
@@ -4557,19 +5214,34 @@ def run_gui():
                                     html = rp.read().decode("utf-8", errors="replace")
                                 import re as _re
                                 import html as _html
-                                blocks = _re.findall(r'data-lyrics-container="true"[^>]*>(.*?)</div>', html, _re.DOTALL)
+                                # Extract full lyric containers by tracking div depth
+                                # (simple regex stops at first nested </div>)
+                                def _extract_containers(h):
+                                    parts = []
+                                    for m in _re.finditer(r'data-lyrics-container="true"[^>]*>', h):
+                                        start = m.end(); depth = 1; i = start
+                                        while i < len(h) and depth > 0:
+                                            o = h.find('<div', i)
+                                            c = h.find('</div>', i)
+                                            if c < 0: break
+                                            if 0 <= o < c:
+                                                depth += 1; i = o + 4
+                                            else:
+                                                depth -= 1
+                                                if depth == 0: parts.append(h[start:c]); break
+                                                i = c + 6
+                                    return parts
+                                blocks = _extract_containers(html)
                                 if blocks:
                                     lines = []
                                     for block in blocks:
                                         t = _re.sub(r'<br\s*/?>', '\n', block)
                                         t = _re.sub(r'<[^>]+>', '', t)
-                                        t = _html.unescape(t)  # decode &#x27; &amp; etc.
+                                        t = _html.unescape(t)
                                         for ln in t.splitlines():
                                             ln = ln.strip()
-                                            # skip section headers like [Chorus], [Verse 1] etc.
                                             if not ln or _re.match(r'^\[.{1,40}\]$', ln):
                                                 continue
-                                            # skip contributor lines ("6 Contributors")
                                             if _re.match(r'^\d+\s+Contributor', ln):
                                                 continue
                                             lines.append(ln)
@@ -4578,6 +5250,7 @@ def run_gui():
                                         txt_dest = os.path.join(dest_dir, f"{song_key}.txt")
                                         with open(txt_dest, "w", encoding="utf-8") as f:
                                             f.write(plain)
+                                        _saved_txt_path = txt_dest   # remember for Whisper trigger
                                         root.after(0, lambda p=txt_dest: vars_["lyrics"].set(p))
                                         log(f"  [fetch] Genius plain lyrics saved: {txt_dest}")
                                     else:
@@ -4595,15 +5268,36 @@ def run_gui():
                             f.write(synced_lrc)
                         root.after(0, lambda p=lrc_dest: vars_["lyrics"].set(p))
                         log(f"  [fetch] Synced lyrics saved: {lrc_dest}")
-                    elif not _find_exe("yt-dlp"):  # only warn if we got this far
-                        log("  [fetch] No synced lyrics found on lrclib.net (song may not be in database)")
+                    else:
+                        log("  [fetch] No synced lyrics found — will auto-timestamp with Whisper if plain lyrics were saved")
                 except Exception as le:
                     log(f"  [fetch] Lyrics fetch failed: {le}")
 
-                root.after(0, lambda: _safe_status("✓ Done!"))
                 root.after(0, _update_player_ui)
-                root.after(800, _close_overlay)
                 root.after(0, lambda: log("  [fetch] Auto-fetch complete."))
+
+                # If we only got plain text lyrics, auto-run Whisper to timestamp them.
+                # Determine the best txt path: prefer what Genius saved, fall back to
+                # whatever is already in vars_["lyrics"] if it's a .txt.
+                _existing_lyr = vars_["lyrics"].get()
+                _txt_for_whisper = None
+                if _saved_txt_path and os.path.isfile(_saved_txt_path):
+                    _txt_for_whisper = _saved_txt_path
+                elif not synced_lrc and _existing_lyr and _existing_lyr.endswith(".txt") and os.path.isfile(_existing_lyr):
+                    _txt_for_whisper = _existing_lyr
+
+                if _txt_for_whisper:
+                    log("  [fetch] Plain lyrics detected — auto-starting Whisper timestamping…")
+                    _twp = _txt_for_whisper
+                    root.after(0, lambda: _safe_status("✓ Done! AI timestamping running in background…"))
+                    root.after(1200, _close_overlay)
+                    def _launch_whisper():
+                        vars_["lyrics"].set(_twp)
+                        _do_ai_timestamps()
+                    root.after(1500, _launch_whisper)
+                else:
+                    root.after(0, lambda: _safe_status("✓ Done!"))
+                    root.after(800, _close_overlay)
             except Exception as e:
                 root.after(0, lambda: _safe_status(f"✗ {e}"))
                 root.after(0, lambda: log(f"  [fetch] Error: {e}"))
@@ -5048,9 +5742,12 @@ def run_gui():
         except Exception as e:
             return messagebox.showerror("Can't read file", f"Not a valid GP7/8 .gp file:\n{e}")
         _gp_ref[0] = gp
-        title2, artist2 = gp.title, gp.artist
+        title2, artist2 = gp.title.strip(), gp.artist.strip()
         m = re.match(r"^(.*)\s+by\s+(.+)$", title2, re.I)
         if m: title2, artist2 = m.group(1).strip(), m.group(2).strip()
+        # Normalize casing — GP files often store metadata in ALL CAPS
+        if title2  == title2.upper():  title2  = title2.title()
+        if artist2 == artist2.upper(): artist2 = artist2.title()
         vars_["title"].set(title2); vars_["artist"].set(artist2)
         gp_album = gp.album.strip()
         vars_["album"].set(gp_album if gp_album else "Single")
@@ -5130,6 +5827,35 @@ def run_gui():
             else:
                 _used_arrs[a] = True
 
+    # ── DO BUILD ──────────────────────────────────────────────────────────────────
+    def do_build():
+        if not vars_["gp"].get() or not os.path.isfile(vars_["gp"].get()):
+            return messagebox.showwarning("Missing GP file", "Load a Guitar Pro file first.")
+        if not vars_["audio"].get() or not os.path.isfile(vars_["audio"].get()):
+            return messagebox.showwarning("Missing audio", "Load an audio file first.")
+
+        bld_win = tk.Toplevel(root)
+        bld_win.title("Building CDLC…")
+        bld_win.geometry("460x130")
+        bld_win.resizable(False, False)
+        bld_win.configure(bg=COL["surface"])
+        bld_win.grab_set()
+        bld_win.transient(root)
+
+        bld_status_var = tk.StringVar(value="Starting build…")
+        styled(tk.Label(bld_win, textvariable=bld_status_var,
+                        font=("Segoe UI", 10), wraplength=420, justify="left"),
+               bg="surface", fg="fg").pack(expand=True, fill="both", padx=24, pady=28)
+
+        def _close_bld():
+            try:
+                bld_win.grab_release()
+                bld_win.destroy()
+            except Exception:
+                pass
+
+        btn_rebuild.configure(state="disabled", text="\u23f3  Building\u2026")
+
         def worker():
             try:
                 o = SimpleNamespace(
@@ -5151,14 +5877,20 @@ def run_gui():
                     scroll_speed  = float(vars_["scroll_speed"].get() or 1.4),
                     pitch         = float(vars_["pitch"].get() or 0),
                     bpm_factor    = float(vars_["bpm_factor"].get() or 1.0),
+                    lrc_offset    = float(vars_["lrc_offset"].get() or 0.0),
                     use_psarc     = bool(psarc_var.get()),
                     use_ddc       = bool(use_ddc.get()),
+                    tracks        = [{"index":      r["index"],
+                                      "include":    r["var_include"].get(),
+                                      "arr":        r["var_arr"].get(),
+                                      "tone_label": r["var_tone"].get()}
+                                     for r in track_rows],
                 )
                 def _prog(msg):
                     root.after(0, lambda m=msg: bld_status_var.set(m))
                     root.after(0, lambda m=msg: log("  " + m))
-                build_cdlc(o, _prog)
-                root.after(0, lambda: bld_status_var.set("\u2713 Build complete!"))
+                build_project(o, _prog)
+                root.after(0, lambda: bld_status_var.set("✓ Build complete!"))
                 root.after(1500, _close_bld)
             except Exception as e:
                 root.after(0, lambda: log("BUILD ERROR: " + str(e)))
@@ -5167,10 +5899,9 @@ def run_gui():
                 root.after(0, _close_bld)
             finally:
                 root.after(0, lambda: btn_rebuild.configure(
-                    state="normal", text="\U0001f3af  Sync & Verify \u2192"))
+                    state="normal", text="🎯  Sync & Verify →"))
         threading.Thread(target=worker, daemon=True).start()
 
-    # Kill all ffplay/ffmpeg child processes on close
     def _on_app_close():
         procs = []
         if _sv.get("proc"): procs.append(_sv["proc"])
@@ -5185,10 +5916,7 @@ def run_gui():
                 try: p.kill()
                 except Exception: pass
         root.destroy()
-
     root.protocol("WM_DELETE_WINDOW", _on_app_close)
-
-    # Show the startup / recent-projects splash on launch
     show_page("main")
     root.after(120, _show_startup_overlay)
     root.mainloop()

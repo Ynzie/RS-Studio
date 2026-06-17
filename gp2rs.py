@@ -142,18 +142,37 @@ class GPSong:
 
     def track_kind(self, ti):
         """'bass', 'guitar', or None (drums/other)."""
-        name = " ".join((self.tracks[ti].findtext("Name") or "").lower().split())
+        tr = self.tracks[ti]
+        name = " ".join((tr.findtext("Name") or "").lower().split())
+        short = " ".join((tr.findtext("ShortName") or "").lower().split())
+        combined = name + " " + short
+
+        # MIDI channel 9 (0-indexed) = percussion channel — always drums
+        for mc in tr.iter("MidiConnection"):
+            if (mc.findtext("Channel") or mc.get("channel") or "") in ("9", "10"):
+                return None
+
+        # Check GP instrument/sound name if present
+        for sound_el in tr.iter("Sound"):
+            sound_name = (sound_el.get("name") or sound_el.text or "").lower()
+            if any(k in sound_name for k in ("drum", "perc", "sax", "trumpet",
+                                              "trombone", "violin", "flute", "piano")):
+                return None
+
         tun = self.tuning(ti)
         if all(t == 0 for t in tun):
             return None
+
         # Non-guitar/bass instruments — exclude before falling through to "guitar"
-        _non_guitar = ("drum", "perc", "vocal", "voc", "voice", "choir",
-                       "sax", "tenor", "alto", "soprano", "baritone",
+        _non_guitar = ("drum", "perc", "kick", "snare", "hat", "cymbal",
+                       "vocal", "voc", "voice", "choir", "lead vox",
+                       "sax", "saxophone", "tenor", "alto", "soprano", "baritone",
                        "trumpet", "trombone", "horn", "brass", "wind",
                        "flute", "clarinet", "oboe", "violin", "viola",
                        "cello", "fiddle", "piano", "keys", "keyboard",
-                       "organ", "synth", "strings", "orchestra")
-        if any(k in name for k in _non_guitar):
+                       "organ", "synth", "strings", "orchestra",
+                       "banjo", "mandolin", "ukulele", "uke")
+        if any(k in combined for k in _non_guitar):
             return None
         if "bass" in name or len(tun) <= 5 and max(tun) < 50:
             return "bass"
@@ -750,21 +769,23 @@ def lyrics_txt_to_vocals(path, gp, leadin):
     return "\n".join(out)
 
 
-def lrc_to_vocals(path, leadin=0.0):
+def lrc_to_vocals(path, leadin=0.0, lrc_offset=0.0):
     """Synced .lrc -> Rocksmith vocals XML (words spread evenly across each line).
 
     .lrc timestamps are relative to the ORIGINAL (un-padded) audio, i.e. t=0 is
     the first sample of the song. Every other chart element (notes, sections,
     offset/startBeat) is relative to the PADDED audio, where bar 1 / the song
     body starts at t=leadin. So `leadin` must be added here too, or every lyric
-    cue fires `leadin` seconds early relative to the music."""
+    cue fires `leadin` seconds early relative to the music.
+    lrc_offset shifts all lyrics earlier (negative) or later (positive)."""
     lines = []
     rx = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\](.*)")
     for raw in open(path, encoding="utf-8", errors="replace"):
         m = rx.match(raw.strip())
         if not m:
             continue
-        t = int(m.group(1)) * 60 + float(m.group(2)) + leadin
+        t = int(m.group(1)) * 60 + float(m.group(2)) + leadin + lrc_offset
+        t = max(0.0, t)
         txt = m.group(3).strip()
         lines.append((t, txt))
     lines.sort()
@@ -867,24 +888,27 @@ def _auto_invocation():
     """Drag-and-drop / double-click support:
     - gp2rs.exe song.gp  (file dragged onto the exe) -> full --all conversion
     - gp2rs.exe          (double-clicked)            -> ask for the file path
-    Outputs land next to the .gp file. A lyrics file named like the song
-    (<song>.lrc or <song>.txt) or 'lyrics.txt' in the same folder is picked
-    up automatically."""
-    import os
-    if len(sys.argv) == 1 and sys.stdin and sys.stdin.isatty():
-        p = input("Drag your .gp file into this window and press Enter: ").strip().strip('"\'')
-        if not p:
-            return False
-        sys.argv.append(p)
-    if len(sys.argv) == 2 and sys.argv[1].lower().endswith(".gp") and os.path.isfile(sys.argv[1]):
-        gpf = sys.argv[1]
-        stem = os.path.splitext(gpf)[0]
-        folder = os.path.dirname(os.path.abspath(gpf))
-        sys.argv += ["--all", "-o", stem + ".xml"]
-        for cand in (stem + ".lrc", stem + ".txt",
-                     os.path.join(folder, "lyrics.lrc"), os.path.join(folder, "lyrics.txt")):
-            if os.path.isfile(cand):
-                sys.argv += (["--lrc", cand] if cand.endswith(".lrc") else ["--lyrics-txt", cand])
-                print(f"found lyrics file: {os.path.basename(cand)}")
-                break
-        r
+    Outputs land next to the .gp file. A lyrics file named like the song is auto-used for LRC timestamps.
+    """
+    import sys as _sys
+    argv = _sys.argv[1:]
+    if not argv:
+        try:
+            path = input("Drag a .gp file here (or type path): ").strip().strip('"')
+        except (EOFError, KeyboardInterrupt):
+            return
+    else:
+        path = argv[0]
+    if not path or not os.path.isfile(path):
+        print(f"File not found: {path!r}")
+        return
+    import argparse as _ap
+    p = _ap.ArgumentParser()
+    p.add_argument("gp", nargs="?", default=path)
+    p.add_argument("--all", action="store_true", default=True)
+    args = p.parse_args([path, "--all"])
+    main(args)
+
+
+if __name__ == "__main__":
+    _auto_invocation()
