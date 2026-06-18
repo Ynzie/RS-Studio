@@ -30,3 +30,11 @@ DeadPoetSocietyCoDa/
 # ── OS files ──────────────────────────────────────────────
 Thumbs.db
 .DS_Store
+/build
+/build/RS STUDIO
+/build
+/build/RS STUDIO
+/dist
+build/RS STUDIO/RS STUDIO.pkg
+/dist
+dist/RS STUDIO.exe

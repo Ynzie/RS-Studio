@@ -510,6 +510,12 @@ def make_arrangement(gp, ti, args):
         spb = (quarters * 60.0 / bpm) / nbeats
         for b in range(nbeats):
             ebeats.append((t0 + b * spb, i + 1 if b == 0 else -1))
+    # CST's SNG serializer builds a beat-time lookup array and crashes with
+    # IndexOutOfRangeException if any phraseIteration/section time exceeds the
+    # last ebeat.  body_end is one beat past the last ebeat (end of last bar),
+    # so clamp everything to last_ebeat_t — exactly what CST does in its own
+    # LoadFromFolder path.
+    last_ebeat_t = ebeats[-1][0] if ebeats else body_end
 
     # sections & phrases
     sec_starts = []
@@ -540,7 +546,7 @@ def make_arrangement(gp, ti, args):
     for t, name in sec_starts:
         counts[name] = counts.get(name, 0) + 1
         sections.append((name, counts[name], t))
-    sections.append(("noguitar", 1, body_end))
+    sections.append(("noguitar", 1, min(body_end, last_ebeat_t)))
 
     phrase_names, phrase_idx = [], {}
     def pid(name):
@@ -551,7 +557,7 @@ def make_arrangement(gp, ti, args):
     iters = [(leadin if not sections else min(leadin, sections[0][2]), pid("COUNT"))]
     for name, num, t in sections[:-1]:
         iters.append((t, pid(name)))
-    iters.append((body_end, pid("END")))
+    iters.append((min(body_end, last_ebeat_t), pid("END")))
 
     # anchors from combined note/chord stream
     stream = []
@@ -618,7 +624,16 @@ def make_arrangement(gp, ti, args):
     A(f"  <lastConversionDateTime>{datetime.now().strftime('%m-%d-%y %H:%M')}</lastConversionDateTime>")
     A(f'  <phrases count="{len(phrase_names)}">')
     for nm in phrase_names:
-        A(f'    <phrase disparity="0" ignore="0" maxDifficulty="0" name="{nm}" solo="0"/>')
+        # The arrangement below contains a SINGLE level (<levels count="1">, the
+        # difficulty="0" full transcription). maxDifficulty is the highest level
+        # index a phrase uses, so with one level it MUST be 0 for every phrase.
+        # Stamping "5" while only level 0 exists makes the toolkit's SNG builder
+        # index a non-existent difficulty and crash with
+        # "Index was outside the bounds of the array."
+        # (When DDC successfully expands the chart to multiple levels it rewrites
+        # these maxDifficulty values itself, so 0 is the correct safe baseline.)
+        _md = "0"
+        A(f'    <phrase disparity="0" ignore="0" maxDifficulty="{_md}" name="{nm}" solo="0"/>')
     A("  </phrases>")
     A(f'  <phraseIterations count="{len(iters)}">')
     for t, p in iters:

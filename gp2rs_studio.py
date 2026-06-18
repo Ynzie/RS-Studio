@@ -126,6 +126,12 @@ def apply_ttk_theme(root, ttk):
     style.map("TCombobox", fieldbackground=[("readonly", COL["field"])], foreground=[("readonly", COL["fg"])], arrowcolor=[("active", COL["accent_hi"])])
     style.configure("TCheckbutton", background=COL["card"], foreground=COL["fg"], focusthickness=0)
     style.map("TCheckbutton", background=[("active", COL["card"])])
+    # Sliders (volume, BPM scale, waveform zoom) — dark groove + accent handle to
+    # match the app instead of the default washed-out clam look.
+    for _sc in ("Horizontal.TScale", "Vertical.TScale"):
+        style.configure(_sc, background=COL["accent"], troughcolor=COL["field"],
+                        borderwidth=0, lightcolor=COL["accent"], darkcolor=COL["accent"])
+        style.map(_sc, background=[("active", COL["accent_hi"]), ("disabled", COL["border"])])
     root.option_add("*TCombobox*Listbox.background", COL["card2"])
     root.option_add("*TCombobox*Listbox.foreground", COL["fg"])
     root.option_add("*TCombobox*Listbox.selectBackground", COL["accent"])
@@ -719,13 +725,21 @@ def _auto_download_tools(log_fn=None):
 
     try:
         if not _find_exe("ddc") and not _find_exe("ddc64"):
-            _log("  [tools] Downloading DDC (Dynamic Difficulty Creator)…")
-            urllib.request.urlretrieve(
-                "https://github.com/rscustomscreator/DDCHarmony/releases/latest/download/ddc.exe",
-                os.path.join(tools, "ddc.exe"))
-            _log("  [tools] ✓ DDC ready")
+            _log("  [tools] Downloading DDC…")
+            _ddc_dest = os.path.join(tools, "ddc.exe")
+            for _u in [
+                "https://github.com/rscustom/rocksmith-custom-song-toolkit/raw/master/Third-party%20Apps/ddc/ddc.exe",
+                "https://github.com/iminashi/DDCImprover/raw/master/DDCImprover.Core/ddc.exe",
+            ]:
+                try:
+                    urllib.request.urlretrieve(_u, _ddc_dest)
+                    if os.path.getsize(_ddc_dest) > 10000: _log("  [tools] ✓ DDC ready"); break
+                    else: os.remove(_ddc_dest)
+                except Exception: pass
+            else:
+                _log("  [tools] DDC auto-download failed — place ddc.exe in tools/ manually")
     except Exception as e:
-        _log(f"  [tools] DDC download failed (not critical): {e}")
+        _log(f"  [tools] DDC download failed: {e}")
 
 def _probe_sample_rate(ffmpeg, path):
     try:
@@ -902,18 +916,178 @@ def fetch_media_pack(artist, title, dest_dir, confirmed_url, log):
         except Exception as e: log(f"  Audio fetch failed: {e}")
     return results
 
+def _find_ddc_support(ddc_path, packer_path, app_dir):
+    """Locate DDC's ramp-up model (.xml) and config (.cfg). These ship in the
+    toolkit's 'ddc' folder; DDC fails silently without them. Returns
+    (ramp_xml, cfg) absolute paths, or (None, None) if not found."""
+    import glob as _glob
+    cand_dirs = []
+    if ddc_path:
+        cand_dirs += [os.path.dirname(ddc_path),
+                      os.path.join(os.path.dirname(ddc_path), "ddc")]
+    if packer_path:
+        _tk = os.path.dirname(packer_path)
+        cand_dirs += [os.path.join(_tk, "ddc"), _tk]
+    if app_dir:
+        cand_dirs += [os.path.join(app_dir, "ddc"),
+                      os.path.join(app_dir, "tools", "ddc"),
+                      os.path.join(app_dir, "tools"), app_dir]
+    seen = set()
+    for d in cand_dirs:
+        if not d or d in seen or not os.path.isdir(d):
+            continue
+        seen.add(d)
+        xmls = _glob.glob(os.path.join(d, "*.xml"))
+        cfgs = _glob.glob(os.path.join(d, "*.cfg"))
+        if not xmls or not cfgs:
+            continue
+        def _pick(paths, *keywords):
+            for kw in keywords:
+                for p in paths:
+                    if kw in os.path.basename(p).lower():
+                        return p
+            return paths[0]
+        ramp = _pick(xmls, "ramp", "default")
+        cfg  = _pick(cfgs, "default")
+        return ramp, cfg
+    return None, None
+
+
+def _apply_ddc(o, xml_files, proj_dir, log):
+    """Add Dynamic Difficulty (beginner-friendly ramped levels) to each instrument
+    arrangement using the EXACT CLI the RocksmithToolkit uses:
+      ddc.exe "file.xml" -l <phraseLen> -s N -m "ramp.xml" -c "cfg.cfg" -p Y -t N
+    DDC overwrites the XML in place (-p Y) and rewrites phrase maxDifficulty to
+    match the levels it generates. Writes _ddc_debug.txt and verifies the level
+    count actually increased so we never silently ship a single-difficulty chart."""
+    ddc_path = _find_exe("ddc") or _find_exe("ddc64")
+    if not ddc_path and getattr(o, "packer_path", ""):
+        _tk = os.path.dirname(o.packer_path)
+        for _dn in (os.path.join("ddc", "ddc.exe"), "ddc.exe", "ddc64.exe"):
+            _dc = os.path.join(_tk, _dn)
+            if os.path.isfile(_dc):
+                ddc_path = _dc
+                break
+    diag = ["DDC DEBUG LOG", f"ddc.exe: {ddc_path}"]
+    if not ddc_path:
+        log("  [DDC] ddc.exe not found — Dynamic Difficulty skipped (chart stays single-difficulty).")
+        return
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    ramp, cfg = _find_ddc_support(ddc_path, getattr(o, "packer_path", ""), app_dir)
+    diag += [f"ramp model: {ramp}", f"config:     {cfg}"]
+    if not ramp or not cfg:
+        log("  [DDC] DDC support files (ramp-up .xml + .cfg) not found next to ddc.exe or the toolkit.")
+        log("  [DDC]   Copy the toolkit's 'ddc' folder (ddc_default.xml + ddc_default.cfg) next to ddc.exe.")
+        log("  [DDC]   Dynamic Difficulty skipped — chart stays single-difficulty for now.")
+        try:
+            with open(os.path.join(proj_dir, "_ddc_debug.txt"), "w", encoding="utf-8") as f:
+                f.write("\n".join(diag) + "\n\nSupport files missing — DD not applied.\n")
+        except Exception:
+            pass
+        return
+    phrase_len = int(getattr(o, "ddc_phraselength", 256) or 256)
+    log("  [DDC] Applying Dynamic Difficulty (beginner-friendly ramped levels)...")
+    ok_count = 0
+    for xml_file in xml_files:
+        fdir, fname = os.path.dirname(xml_file), os.path.basename(xml_file)
+        cmd = [ddc_path, fname, "-l", str(phrase_len), "-s", "N",
+               "-m", ramp, "-c", cfg, "-p", "Y", "-t", "N"]
+        diag.append("\n" + "=" * 60 + f"\nCMD: {' '.join(cmd)}\n(cwd={fdir})")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900,
+                               creationflags=CREATE_NO_WINDOW, cwd=fdir)
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            diag.append(f"exit={r.returncode}\n{out}")
+            lv = 0
+            try:
+                with open(xml_file, "r", encoding="utf-8", errors="replace") as _xf:
+                    _m = re.search(r'<levels count="(\d+)"', _xf.read())
+                lv = int(_m.group(1)) if _m else 0
+            except Exception:
+                pass
+            diag.append(f"levels after DDC: {lv}")
+            if r.returncode == 0 and lv > 1:
+                ok_count += 1
+                log(f"  [DDC] ✓ {fname}: {lv} difficulty levels")
+            else:
+                log(f"  [DDC] ⚠ {fname}: rc={r.returncode}, levels={lv} (see _ddc_debug.txt)")
+        except Exception as e:
+            diag.append(f"EXCEPTION: {e}")
+            log(f"  [DDC] ⚠ error on {fname}: {e}")
+    try:
+        with open(os.path.join(proj_dir, "_ddc_debug.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(diag))
+    except Exception:
+        pass
+    if ok_count == 0:
+        log("  [DDC] No arrangements got DD — chart stays single-difficulty. See _ddc_debug.txt for why.")
+
+
 def _run_packer(o, proj_dir, key, tmpl, result, log):
     packer = o.packer_path or _find_packer()
     if not packer: return log("  [psarc] packer.exe not found - skipping build.")
+    try:
+        os.makedirs(os.path.join(os.environ.get("TEMP",""), "tmp"), exist_ok=True)
+    except Exception: pass
     psarc_out = os.path.join(proj_dir, f"{key}_p.psarc")
     cmd = [packer, "-b", f"-t={tmpl}", f"-o={psarc_out}", "-f=Pc", "-v=RS2014"]
     log(f"  [psarc] cmd: {' '.join(cmd)}")
+
+    # Full diagnostic log written next to the project so nothing is lost/truncated.
+    diag_path = os.path.join(proj_dir, "_packer_debug.txt")
+    diag_lines = []
+    def _diag(s=""):
+        diag_lines.append(str(s))
+
+    # ── Snapshot of what the packer actually has to work with ──────────────
+    _diag("=" * 70)
+    _diag("RS STUDIO PACKER DEBUG LOG")
+    _diag("packer.exe : " + str(packer))
+    _diag("project dir: " + str(proj_dir))
+    _diag("template   : " + str(tmpl))
+    _diag("output     : " + str(psarc_out))
+    _diag("command    : " + " ".join(cmd))
+    _diag("-" * 70)
+    _diag("PROJECT FOLDER CONTENTS (name — size in bytes):")
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, creationflags=CREATE_NO_WINDOW)
+        for fn in sorted(os.listdir(proj_dir)):
+            fp = os.path.join(proj_dir, fn)
+            try: sz = os.path.getsize(fp)
+            except Exception: sz = -1
+            _diag(f"  {fn} — {sz}")
+    except Exception as e:
+        _diag("  (could not list folder: %s)" % e)
+    # Cross-check: do the asset files referenced in the .dlc.xml actually exist?
+    _diag("-" * 70)
+    _diag("ASSET REFERENCE CHECK (files named inside the .dlc.xml):")
+    try:
+        import re as _re_dbg
+        with open(tmpl, "r", encoding="utf-8") as _tf:
+            _txml = _tf.read()
+        _refs = set()
+        for _tag in ("AlbumArtPath", "OggPath", "OggPreviewPath"):
+            _m = _re_dbg.search(rf"<{_tag}>(.*?)</{_tag}>", _txml)
+            if _m and _m.group(1).strip(): _refs.add(_m.group(1).strip())
+        for _m in _re_dbg.finditer(r"<g:File>(.*?)</g:File>", _txml):
+            if _m.group(1).strip(): _refs.add(_m.group(1).strip())
+        for _ref in sorted(_refs):
+            _exists = os.path.isfile(os.path.join(proj_dir, _ref))
+            _diag(f"  {'OK ' if _exists else 'MISSING'}  {_ref}")
+            if not _exists:
+                _diag(f"      ^^ referenced in .dlc.xml but NOT found in project folder")
+    except Exception as e:
+        _diag("  (could not parse template: %s)" % e)
+    _diag("=" * 70)
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, creationflags=CREATE_NO_WINDOW, cwd=proj_dir)
         combined = ((r.stdout or "") + (r.stderr or "")).strip()
         result["packer_output"] = combined
-        # Always log the output so we can diagnose
-        for line in combined.splitlines()[:30]:
+        _diag("PACKER EXIT CODE: %s" % r.returncode)
+        _diag("PACKER STDOUT:"); _diag(r.stdout or "(empty)")
+        _diag("PACKER STDERR:"); _diag(r.stderr or "(empty)")
+        # Log the FULL output to the console too (not truncated) so it shows in the build window.
+        for line in combined.splitlines():
             if line.strip(): log(f"  [psarc] {line.rstrip()}")
         if r.returncode == 0 and os.path.exists(psarc_out):
             log(f"  [psarc] BUILT: {os.path.basename(psarc_out)}")
@@ -921,58 +1095,71 @@ def _run_packer(o, proj_dir, key, tmpl, result, log):
         else:
             log(f"  [psarc] packer.exe exited rc={r.returncode}, file exists={os.path.exists(psarc_out)}")
             result["packer_failed"] = True
+            # On failure, capture packer's own usage text so we can confirm the
+            # exact CLI flags THIS packer.exe build supports (versions differ).
+            try:
+                h = subprocess.run([packer, "--help"], capture_output=True, text=True,
+                                   timeout=30, creationflags=CREATE_NO_WINDOW)
+                _diag("-" * 70)
+                _diag("PACKER --help OUTPUT:")
+                _diag((h.stdout or "") + (h.stderr or "") or "(no help text)")
+            except Exception as he:
+                _diag("(packer --help failed: %s)" % he)
     except Exception as e:
         log(f"  [psarc] exception: {e}")
+        _diag("PYTHON EXCEPTION running packer: %s" % e)
         result["packer_failed"] = True
 
-def _prepare_art_for_packer(src_art, proj_dir, key, log):
-    """
-    Convert album art to a 512x512 DDS file that packer.exe can read directly,
-    bypassing its broken temp-directory DDS conversion.
-    
-    Priority: ffmpeg DDS > PIL resize jpg > original file
-    Returns absolute path to the best available art file.
-    """
-    dds_out = os.path.join(proj_dir, f"{key}_art.dds")
-    jpg_out  = os.path.join(proj_dir, f"{key}_art512.jpg")
-
-    # 1. Try ffmpeg → DDS (best: packer reads it directly, no temp conversion needed)
-    ff = _find_exe("ffmpeg")
-    if ff:
-        try:
-            r = subprocess.run(
-                [ff, "-y", "-i", src_art,
-                 "-vf", "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2",
-                 "-pix_fmt", "bgra", dds_out],
-                capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW
-            )
-            if r.returncode == 0 and os.path.exists(dds_out) and os.path.getsize(dds_out) > 1000:
-                log(f"  [art] converted to DDS: {os.path.basename(dds_out)}")
-                return dds_out
-            else:
-                log(f"  [art] ffmpeg DDS failed (rc={r.returncode}), trying JPEG resize")
-        except Exception as e:
-            log(f"  [art] ffmpeg DDS exception: {e}")
-
-    # 2. Try PIL → 512x512 JPEG
+    # Always write the debug log.
     try:
-        from PIL import Image as _PILImg
-        img = _PILImg.open(src_art).convert("RGB")
-        img = img.resize((512, 512), _PILImg.Resampling.LANCZOS)
-        img.save(jpg_out, "JPEG", quality=95)
-        log(f"  [art] resized to 512x512 JPEG: {os.path.basename(jpg_out)}")
-        return jpg_out
+        with open(diag_path, "w", encoding="utf-8") as _df:
+            _df.write("\n".join(diag_lines))
+        log(f"  [psarc] Full debug log written: {diag_path}")
     except Exception as e:
-        log(f"  [art] PIL resize failed ({e}), using original")
+        log(f"  [psarc] (could not write debug log: {e})")
 
-    # 3. Fallback: original file as-is (packer may still fail but we tried)
+def _write_dds_bgra(img_path, out_path):
+    """Write a 512x512 uncompressed BGRA DDS — Pillow only, no ffmpeg needed."""
+    import struct
+    from PIL import Image as _PI
+    img = _PI.open(img_path).convert("RGBA").resize((512, 512))
+    r, g, b, a = img.split()
+    bgra = _PI.merge("RGBA", (b, g, r, a))
+    raw = bgra.tobytes()
+    w = h = 512
+    hdr  = b"DDS "
+    hdr += struct.pack("<I", 124)                     # dwSize
+    hdr += struct.pack("<IIIII", 0x0010100F, h, w, w * 4, 0)  # flags,h,w,pitch,depth
+    hdr += struct.pack("<I", 0) + b"\x00" * 44        # mipCount + reserved
+    # DDPIXELFORMAT — 8 uint32s = 32 bytes; FourCC=0 (uncompressed BGRA)
+    hdr += struct.pack("<IIIIIIII",
+        32, 0x41, 0, 32,
+        0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
+    hdr += struct.pack("<IIIII", 0x1000, 0, 0, 0, 0)  # DDSCAPS
+    assert len(hdr) == 128
+    with open(out_path, "wb") as f:
+        f.write(hdr)
+        f.write(raw)
+
+
+def _prepare_art_for_packer(src_art, proj_dir, key, log):
+    """Convert album art to 512x512 uncompressed BGRA DDS for packer.exe."""
+    dds_out = os.path.join(proj_dir, f"{key}_art.dds")
+    try:
+        _write_dds_bgra(src_art, dds_out)
+        if os.path.getsize(dds_out) > 1000:
+            log(f"  [art] DDS ready: {os.path.basename(dds_out)}")
+            return dds_out
+    except Exception as e:
+        log(f"  [art] DDS write failed ({e}), using original")
     return src_art
 
 
 def build_project(o, log=print):
     gp = gp2rs.GPSong(o.gp_path)
     key = make_dlc_key(o.artist, o.title)
-    proj_dir = os.path.join(o.out_dir, key)
+    _folder = getattr(o, "song_folder", "") or key
+    proj_dir = os.path.join(o.out_dir, _folder)
     os.makedirs(proj_dir, exist_ok=True)
     log(f"Building Project: {proj_dir}")
     xml_files_for_ddc = []
@@ -1031,7 +1218,14 @@ def build_project(o, log=print):
     vocals_name = None
     if o.lyrics_path:
         _lrc_off = getattr(o, "lrc_offset", 0.0)
-        vxml = gp2rs.lrc_to_vocals(o.lyrics_path, o.leadin, lrc_offset=_lrc_off) if o.lyrics_path.endswith(".lrc") else gp2rs.lyrics_txt_to_vocals(o.lyrics_path, gp, o.leadin)
+        # Prefer .lrc over .txt — Whisper may have finished after vars_ was snapshotted
+        _eff_lyrics = o.lyrics_path
+        if not _eff_lyrics.endswith(".lrc"):
+            _adj_lrc = os.path.splitext(_eff_lyrics)[0] + ".lrc"
+            if os.path.isfile(_adj_lrc):
+                _eff_lyrics = _adj_lrc
+                log(f"  [vocals] Using adjacent LRC: {os.path.basename(_adj_lrc)}")
+        vxml = gp2rs.lrc_to_vocals(_eff_lyrics, o.leadin, lrc_offset=_lrc_off) if _eff_lyrics.endswith(".lrc") else gp2rs.lyrics_txt_to_vocals(_eff_lyrics, gp, o.leadin)
         vname = f"{key}_vocals.xml"
         vocals_name = vname
         with open(os.path.join(proj_dir, vname), "w", encoding="utf-8") as f: f.write(vxml)
@@ -1059,14 +1253,7 @@ def build_project(o, log=print):
     proj_path = os.path.join(proj_dir, f"{key}.rs2dlc")
     with open(proj_path, "w", encoding="utf-8") as f: json.dump(project, f, indent=2)
     if getattr(o, "use_ddc", False):
-        ddc_path = _find_exe("ddc") or _find_exe("ddc64")
-        if ddc_path:
-            log("  [DDC] Applying Dynamic Difficulty to arrangements...")
-            for xml_file in xml_files_for_ddc:
-                try: subprocess.run([ddc_path, "-m", "4", "-p", "m", xml_file], creationflags=CREATE_NO_WINDOW)
-                except Exception as e: log(f"  [DDC Error] on {os.path.basename(xml_file)}: {e}")
-        else:
-            log("  [DDC] Note: ddc.exe not found in app folder. Open .rs2dlc in DLC Builder to apply DDC.")
+        _apply_ddc(o, xml_files_for_ddc, proj_dir, log)
     if getattr(o, "make_psarc", False):
         if cst_template is not None:
             # Full Wwise + CST path
@@ -1111,6 +1298,24 @@ def build_project(o, log=print):
 
 
 # ─── GUI ────────────────────────────────────────────────────────────────────
+
+
+def _load_logo(size=80):
+    """Load rs_studio.png from same dir as exe/script, return PhotoImage or None."""
+    try:
+        from PIL import Image, ImageTk
+        import sys as _sys_l
+        _base = os.path.dirname(getattr(_sys_l, "executable", __file__))
+        _png = os.path.join(_base, "rs_studio.png")
+        if not os.path.isfile(_png):
+            _png = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rs_studio.png")
+        if not os.path.isfile(_png):
+            return None
+        img = Image.open(_png).convert("RGBA")
+        img = img.resize((size, size), Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+    except Exception:
+        return None
 
 def run_gui():
     import tkinter as tk
@@ -1383,8 +1588,13 @@ def run_gui():
 
         logo_row = tk.Frame(outer, bg=COL["surface"])
         logo_row.pack(pady=(0, 4))
-        tk.Label(logo_row, text="RS", font=("Segoe UI Black", 38), fg=COL["accent"], bg=COL["surface"]).pack(side="left")
-        tk.Label(logo_row, text=" STUDIO", font=("Segoe UI", 38, "bold"), fg=COL["fg"], bg=COL["surface"]).pack(side="left")
+        _setup_logo = _load_logo(100)
+        if _setup_logo:
+            _sl = tk.Label(logo_row, image=_setup_logo, bg=COL["surface"]); _sl.image = _setup_logo; _sl.pack(side="left", padx=(0,12), anchor="center")
+            tk.Label(logo_row, text="STUDIO", font=("Segoe UI", 38, "bold"), fg=COL["fg"], bg=COL["surface"]).pack(side="left", anchor="center")
+        else:
+            tk.Label(logo_row, text="RS", font=("Segoe UI Black", 38), fg=COL["accent"], bg=COL["surface"]).pack(side="left")
+            tk.Label(logo_row, text=" STUDIO", font=("Segoe UI", 38, "bold"), fg=COL["fg"], bg=COL["surface"]).pack(side="left")
         tk.Label(outer, text="First Time Setup  —  Downloading required tools",
                  font=("Segoe UI", 11), fg=COL["muted"], bg=COL["surface"]).pack(pady=(0, 24))
 
@@ -1393,13 +1603,14 @@ def run_gui():
 
         def _whisper_ok():
             import importlib.util
-            return importlib.util.find_spec("faster_whisper") is not None
+            return (importlib.util.find_spec("stable_whisper") is not None or
+                    importlib.util.find_spec("faster_whisper") is not None)
 
         _TOOL_ROWS = [
-            ("ytdlp",   "yt-dlp",                   lambda: bool(_find_exe("yt-dlp"))),
-            ("ffmpeg",  "ffmpeg + ffplay",            lambda: bool(_find_exe("ffmpeg") and _find_exe("ffplay"))),
-            ("ddc",     "DDC (optional)",             lambda: bool(_find_exe("ddc") or _find_exe("ddc64"))),
-            ("whisper", "AI Timestamps (optional)",   _whisper_ok),
+            ("ytdlp",   "yt-dlp",          lambda: bool(_find_exe("yt-dlp"))),
+            ("ffmpeg",  "ffmpeg + ffplay",  lambda: bool(_find_exe("ffmpeg") and _find_exe("ffplay"))),
+            ("ddc",     "DDC",              lambda: bool(_find_exe("ddc") or _find_exe("ddc64"))),
+            ("whisper", "AI Timestamps",    _whisper_ok),
         ]
         tv, tl = {}, {}
         for key, label, _ in _TOOL_ROWS:
@@ -1501,46 +1712,76 @@ def run_gui():
             _set_pb(80)
 
             # --- DDC ---
-            if not _find_exe("ddc") and not _find_exe("ddc64"):
+            def _find_ddc_anywhere():
+                found = _find_exe("ddc") or _find_exe("ddc64")
+                if found: return found
+                packer_path = load_settings().get("packer", "")
+                if packer_path and os.path.isfile(packer_path):
+                    for _r, _d, _f in os.walk(os.path.dirname(packer_path)):
+                        if os.path.relpath(_r, os.path.dirname(packer_path)).count(os.sep) > 2: _d[:] = []; continue
+                        for _fn in ("ddc.exe", "ddc64.exe"):
+                            if _fn in _f:
+                                _found = os.path.join(_r, _fn)
+                                try: shutil.copy2(_found, os.path.join(tools, _fn))
+                                except Exception: pass
+                                return _found
+                return None
+
+            if not _find_ddc_anywhere():
                 root.after(0, lambda: tv["ddc"].set("⬇  DDC…"))
                 _set_status("Downloading DDC…")
-                try:
-                    urllib.request.urlretrieve(
-                        "https://github.com/rscustomscreator/DDCHarmony/releases/latest/download/ddc.exe",
-                        os.path.join(tools, "ddc.exe"))
-                    _mark_ok("ddc", "DDC (optional)")
-                    log("  [setup] ✓ DDC")
-                except Exception:
-                    _mark_skip("ddc", "DDC (optional)")
+                _ddc_dest = os.path.join(tools, "ddc.exe")
+                _ddc_ok = False
+                for _u in [
+                    "https://github.com/rscustom/rocksmith-custom-song-toolkit/raw/master/Third-party%20Apps/ddc/ddc.exe",
+                    "https://github.com/iminashi/DDCImprover/raw/master/DDCImprover.Core/ddc.exe",
+                ]:
+                    try:
+                        urllib.request.urlretrieve(_u, _ddc_dest)
+                        if os.path.exists(_ddc_dest) and os.path.getsize(_ddc_dest) > 10000: _ddc_ok = True; break
+                        elif os.path.exists(_ddc_dest): os.remove(_ddc_dest)
+                    except Exception: pass
+                if _ddc_ok:
+                    _mark_ok("ddc", "DDC"); log("  [setup] ✓ DDC")
+                else:
+                    _mark_err("ddc", "DDC")
+                    log("  [setup] DDC auto-download failed.")
+                    root.after(500, lambda: messagebox.showwarning(
+                        "DDC Not Found",
+                        "DDC could not be downloaded automatically.\n\n"
+                        "To fix:\n"
+                        "1. Open your RocksmithToolkit folder\n"
+                        "2. Find ddc.exe in Third-party Apps\\ddc\\\n"
+                        "3. Copy it into the  tools\\  folder next to RS STUDIO.exe\n\n"
+                        "Then restart RS Studio."))
+            else:
+                _mark_ok("ddc", "DDC"); log("  [setup] ✓ DDC found")
             _set_pb(85)
 
-            # --- faster-whisper ---
+            # --- stable-ts + faster-whisper ---
             if not _whisper_ok():
-                root.after(0, lambda: tv["whisper"].set("⬇  AI Timestamps  (watch CMD window)…"))
-                _set_status("Installing faster-whisper via pip…")
+                root.after(0, lambda: tv["whisper"].set("⬇  AI Timestamps…"))
+                _set_status("Installing stable-ts + faster-whisper…")
                 try:
-                    subprocess.run(
-                        ["cmd", "/C",
-                         "py -m pip install faster-whisper || python -m pip install faster-whisper"],
-                        creationflags=subprocess.CREATE_NEW_CONSOLE
-                    )
-                    import importlib, sys as _sys
-                    importlib.invalidate_caches()
-                    for _k in list(_sys.modules.keys()):
-                        if "faster_whisper" in _k:
-                            del _sys.modules[_k]
+                    import sys as _sys2
+                    subprocess.run([_sys2.executable, "-m", "pip", "install", "--quiet",
+                                    "stable-ts", "faster-whisper"],
+                                   check=False, creationflags=CREATE_NO_WINDOW)
+                    import importlib as _il2
+                    _il2.invalidate_caches()
+                    for _k in list(_sys2.modules.keys()):
+                        if "stable_whisper" in _k or "faster_whisper" in _k: del _sys2.modules[_k]
                     if _whisper_ok():
-                        _mark_ok("whisper", "AI Timestamps (optional)")
-                        log("  [setup] ✓ faster-whisper")
+                        _mark_ok("whisper", "AI Timestamps"); log("  [setup] ✓ stable-ts + faster-whisper")
                     else:
-                        _mark_skip("whisper", "AI Timestamps (optional)")
-                        log("  [setup] faster-whisper not found after install attempt")
+                        _mark_err("whisper", "AI Timestamps")
+                        log("  [setup] stable-ts install failed — run: pip install stable-ts faster-whisper")
                 except Exception as _we:
-                    _mark_skip("whisper", "AI Timestamps (optional)")
-                    log(f"  [setup] faster-whisper install error: {_we}")
+                    _mark_err("whisper", "AI Timestamps"); log(f"  [setup] stable-ts install error: {_we}")
             _set_pb(100)
 
             _set_status("✓ All done!")
+            _overlay_shown[0] = False
             root.after(1000, _show_startup_overlay)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -1556,7 +1797,8 @@ def run_gui():
         # First-time setup: show setup screen if any required tool is missing
         def _whisper_installed():
             import importlib.util
-            return importlib.util.find_spec("faster_whisper") is not None
+            return (importlib.util.find_spec("stable_whisper") is not None or
+                    importlib.util.find_spec("faster_whisper") is not None)
         if not (_find_exe("yt-dlp") and _find_exe("ffmpeg") and _find_exe("ffplay")) \
                 or not _whisper_installed():
             _show_setup_screen()
@@ -1570,13 +1812,19 @@ def run_gui():
         outer = tk.Frame(startup_overlay, bg=COL["surface"])
         outer.place(relx=0.5, rely=0.5, anchor="center")
 
-        # ── Logo ────────────────────────────────────────────────────
+        # ── Logo ────────────────────────────────────────────────────────────
         logo_row = tk.Frame(outer, bg=COL["surface"])
         logo_row.pack(pady=(0, 2))
-        tk.Label(logo_row, text="RS", font=("Segoe UI Black", 44),
-                 fg=COL["accent"], bg=COL["surface"]).pack(side="left")
-        tk.Label(logo_row, text=" STUDIO", font=("Segoe UI", 44, "bold"),
-                 fg=COL["fg"], bg=COL["surface"]).pack(side="left")
+        _splash_logo = _load_logo(120)
+        if _splash_logo:
+            _spl = tk.Label(logo_row, image=_splash_logo, bg=COL["surface"]); _spl.image = _splash_logo; _spl.pack(side="left", padx=(0,14), anchor="center")
+            tk.Label(logo_row, text="STUDIO", font=("Segoe UI", 44, "bold"),
+                     fg=COL["fg"], bg=COL["surface"]).pack(side="left", anchor="center")
+        else:
+            tk.Label(logo_row, text="RS", font=("Segoe UI Black", 44),
+                     fg=COL["accent"], bg=COL["surface"]).pack(side="left")
+            tk.Label(logo_row, text=" STUDIO", font=("Segoe UI", 44, "bold"),
+                     fg=COL["fg"], bg=COL["surface"]).pack(side="left")
         tk.Label(outer, text="Automated CDLC Pipeline",
                  font=("Segoe UI", 11), fg=COL["muted"],
                  bg=COL["surface"]).pack(pady=(0, 30))
@@ -1590,7 +1838,7 @@ def run_gui():
         left_col.pack(side="left", anchor="n", padx=(0, 0))
 
         def _new_project():
-            startup_overlay.place_forget()
+            startup_overlay.place_forget(); player_bar.grid()
 
         def _open_existing():
             gp = filedialog.askopenfilename(
@@ -1599,7 +1847,7 @@ def run_gui():
                            ("All files", "*.*")])
             if not gp:
                 return
-            startup_overlay.place_forget()
+            startup_overlay.place_forget(); player_bar.grid()
             root.after(50, lambda: load_gp(gp))
 
         _bkw = dict(font=("Segoe UI Semibold", 11), cursor="hand2",
@@ -1684,7 +1932,7 @@ def run_gui():
                 if not g or not os.path.exists(g):
                     return messagebox.showwarning("File not found",
                         f"GP file not found:\n{g}")
-                startup_overlay.place_forget()
+                startup_overlay.place_forget(); player_bar.grid()
                 # Restore previously saved file paths before load_gp runs
                 if a    and os.path.exists(a):    vars_["art"].set(a)
                 if lrc  and os.path.exists(lrc):  vars_["lyrics"].set(lrc)
@@ -1865,8 +2113,8 @@ def run_gui():
         """Search lrclib.net for synced (LRC) or plain lyrics using artist+title."""
         # Prefer YouTube-sourced artist/title — more reliable than GP-derived field values
         _yt = _yt_meta_cache[0]
-        artist = (_yt.get("artist") or vars_["artist"].get()).strip()
-        title  = (_yt.get("title")  or vars_["title"].get()).strip()
+        artist = (vars_["artist"].get().strip() or _yt.get("artist", "")).strip()
+        title  = (vars_["title"].get().strip()  or _yt.get("title",  "")).strip()
         if not artist or not title:
             return messagebox.showerror("Missing info",
                 "Fill in Artist and Title fields before fetching lyrics.")
@@ -1974,9 +2222,13 @@ def run_gui():
                 root.after(0, lambda: _lyr_btn.configure(state="normal"))
                 return
 
-            # Save to per-song subfolder (same structure as automagic download)
+            # Save to per-song subfolder. IMPORTANT: reuse the folder name that the
+            # auto-download step already locked in (_sv["song_key"]). The iTunes
+            # title-correction fires AFTER that folder is created and changes `title`,
+            # so recomputing the slug here used to scatter the .lrc into a second,
+            # differently-named folder than the audio + the build folder.
             def _sfn(s): return re.sub(r"[^\w\- ]", "", s).strip().replace(" ", "_")[:40]
-            _sk = _sfn(artist) + "_" + _sfn(title)
+            _sk = (_sv.get("song_key") or "").strip() or (_sfn(artist) + "_" + _sfn(title))
             song_dir = os.path.join(out_dir, _sk)
             os.makedirs(song_dir, exist_ok=True)
 
@@ -2013,7 +2265,7 @@ def run_gui():
         # Prevent the startup splash from appearing mid-install
         _overlay_shown[0] = True
         try:
-            startup_overlay.place_forget()
+            startup_overlay.place_forget(); player_bar.grid()
         except Exception:
             pass
 
@@ -2039,197 +2291,170 @@ def run_gui():
 
         def _worker():
             try:
-                # 1. Import faster-whisper — auto-install via CMD window if missing
-                _status("Loading Whisper…")
-                _fw = None
-                try:
-                    import faster_whisper as _fw
-                except ImportError:
-                    # Open a visible CMD window so the user can watch pip install
-                    _status("⏳ Installing faster-whisper… (watch CMD window)")
-                    try:
-                        subprocess.Popen(
-                            ["cmd", "/K",
-                             "echo Installing faster-whisper for RS Studio... && "
-                             "py -m pip install faster-whisper || "
-                             "python -m pip install faster-whisper && "
-                             "echo. && echo Done! You can close this window."],
-                            creationflags=subprocess.CREATE_NEW_CONSOLE
-                        )
-                    except Exception as _ie:
-                        root.after(0, lambda: messagebox.showerror(
-                            "Install failed",
-                            f"Could not open CMD:\n{_ie}\n\n"
-                            "Please run:  pip install faster-whisper  manually."))
-                        root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
-                        root.after(0, lambda: _ts_btn.configure(state="normal"))
-                        return
-                    # Poll every 3 s until importable (max ~3 min)
-                    import importlib, time as _time, sys as _sys
-                    for _attempt in range(60):
-                        _time.sleep(3)
-                        importlib.invalidate_caches()
-                        for _k in list(_sys.modules.keys()):
-                            if "faster_whisper" in _k:
-                                del _sys.modules[_k]
-                        try:
-                            import faster_whisper as _fw
-                            break
-                        except ImportError:
-                            _status(f"⏳ Waiting for install… ({(_attempt+1)*3}s)")
-                    if _fw is None:
-                        root.after(0, lambda: messagebox.showwarning(
-                            "Not installed yet",
-                            "faster-whisper still not found.\n"
-                            "Make sure the CMD window finished, then click again."))
-                        root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
-                        root.after(0, lambda: _ts_btn.configure(state="normal"))
-                        return
-
-                # 2. Load model — GPU if available, CPU fallback
-                model_dir = os.path.join(_get_tools_dir(), "whisper_models")
-                os.makedirs(model_dir, exist_ok=True)
-                _status("Loading Whisper model…")
-                try:
-                    model = _fw.WhisperModel("tiny", device="cuda",
-                                             compute_type="float16", download_root=model_dir)
-                    log("  [whisper] Using GPU (CUDA)")
-                except Exception:
-                    try:
-                        model = _fw.WhisperModel("tiny", device="cuda",
-                                                 compute_type="int8", download_root=model_dir)
-                        log("  [whisper] Using GPU (CUDA int8)")
-                    except Exception:
-                        model = _fw.WhisperModel("tiny", device="cpu",
-                                                 compute_type="int8", download_root=model_dir)
-                        log("  [whisper] GPU unavailable — using CPU")
-
-                # 3. Transcribe with word timestamps
-                _status("Transcribing audio… (30–90 sec, check Log)")
-                segments_gen, _ = model.transcribe(audio_path, word_timestamps=True,
-                                                language="en", beam_size=1,
-                                                vad_filter=True, vad_parameters={"min_silence_duration_ms": 300})
-                all_words = []
-                for seg in segments_gen:
-                    for w in (seg.words or []):
-                        all_words.append((w.start, w.word.strip()))
-
-                if not all_words:
-                    root.after(0, lambda: messagebox.showerror(
-                        "No speech detected", "Whisper found no words — check the audio file."))
-                    root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
-                    root.after(0, lambda: _ts_btn.configure(state="normal"))
-                    return
-
-                # 4. Load lyric lines
                 import re as _re3
-                with open(lyrics_path, "r", encoding="utf-8") as f:
-                    raw_lines = f.readlines()
+                _status("Loading aligner…")
+                _st = None
+                try:
+                    import stable_whisper as _st
+                except ImportError:
+                    _status("Installing stable-ts…")
+                    try:
+                        import sys as _sys3
+                        subprocess.run([_sys3.executable, "-m", "pip", "install", "--quiet",
+                                        "stable-ts", "faster-whisper"],
+                                       check=False, creationflags=CREATE_NO_WINDOW)
+                    except Exception as _ie:
+                        root.after(0, lambda: messagebox.showerror("Install failed", f"pip install stable-ts failed:\n{_ie}"))
+                        root.after(0, lambda: _ts_btn_var.set("\U0001f3a4 Get AI Timestamps"))
+                        root.after(0, lambda: _ts_btn.configure(state="normal"))
+                        return
+                    import importlib as _il3, sys as _sys3
+                    _il3.invalidate_caches()
+                    for _k in list(_sys3.modules.keys()):
+                        if "stable_whisper" in _k: del _sys3.modules[_k]
+                    try:
+                        import stable_whisper as _st
+                    except ImportError:
+                        root.after(0, lambda: messagebox.showwarning("Not installed yet",
+                            "stable-ts not found after install.\nClose and reopen RS Studio, then try again."))
+                        root.after(0, lambda: _ts_btn_var.set("\U0001f3a4 Get AI Timestamps"))
+                        root.after(0, lambda: _ts_btn.configure(state="normal"))
+                        return
 
-                # Filter: strip LRC tags, metadata credits, blank lines
-                _meta_pat = _re3.compile(
-                    r"^(source|songwriters?|writers?|composers?|lyrics?)\s*[:\.]",
-                    _re3.IGNORECASE)
-                _tag_pat  = _re3.compile(r"^\[.{0,40}\]$")
-                raw_plain = []
-                for l in raw_lines:
-                    l = l.strip()
-                    if not l: continue
-                    if _tag_pat.match(l): continue
-                    if _meta_pat.match(l): continue
-                    raw_plain.append(l)
-
-                # Split very long lines (>12 words) at punctuation so alignment works
-                def _split_long(line, max_words=12):
-                    words = line.split()
-                    if len(words) <= max_words:
-                        return [line]
-                    # Try splitting at punctuation boundaries
-                    chunks, cur = [], []
-                    for w in words:
-                        cur.append(w)
-                        if len(cur) >= max_words and w[-1] in ".,!?;":
-                            chunks.append(" ".join(cur)); cur = []
-                    # Force-split whatever's left by max_words
-                    if cur:
-                        while len(cur) > max_words:
-                            chunks.append(" ".join(cur[:max_words])); cur = cur[max_words:]
-                        if cur:
-                            chunks.append(" ".join(cur))
-                    return chunks if chunks else [line]
-
-                plain_lines = []
-                for l in raw_plain:
-                    plain_lines.extend(_split_long(l))
+                with open(lyrics_path, "r", encoding="utf-8") as _lf:
+                    raw_lines = _lf.readlines()
+                _meta_pat = _re3.compile(r"^(source|songwriters?|writers?|composers?|lyrics?)\s*[:\.]", _re3.IGNORECASE)
+                _tag_pat = _re3.compile(r"^\[.{0,40}\]$")
+                plain_lines = [_l.strip() for _l in raw_lines
+                               if _l.strip() and not _tag_pat.match(_l.strip()) and not _meta_pat.match(_l.strip())]
 
                 if not plain_lines:
-                    root.after(0, lambda: messagebox.showerror(
-                        "Empty lyrics", "No lyric lines found in file."))
-                    root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
+                    root.after(0, lambda: messagebox.showerror("Empty lyrics", "No lyric lines found in the .txt file."))
+                    root.after(0, lambda: _ts_btn_var.set("\U0001f3a4 Get AI Timestamps"))
                     root.after(0, lambda: _ts_btn.configure(state="normal"))
                     return
 
-                log(f"  [whisper] {len(plain_lines)} lyric lines to align")
+                log(f"  [align] {len(plain_lines)} lyric lines to align")
+                model_dir = os.path.join(_get_tools_dir(), "whisper_models")
+                os.makedirs(model_dir, exist_ok=True)
+                _status("Loading model…")
+                try:
+                    _model = _st.load_faster_whisper("small", device="cuda", compute_type="float16", download_root=model_dir)
+                    log("  [align] GPU CUDA float16")
+                except Exception:
+                    try:
+                        _model = _st.load_faster_whisper("small", device="cuda", compute_type="int8", download_root=model_dir)
+                        log("  [align] GPU CUDA int8")
+                    except Exception:
+                        _model = _st.load_faster_whisper("small", device="cpu", compute_type="int8", download_root=model_dir)
+                        log("  [align] CPU fallback")
 
-                # 5. Align each lyric line to transcribed words (greedy sliding window)
-                _status("Aligning lyrics to timestamps…")
+                # ── Step 1: forced align to get coarse segment timing ──────────────
+                _status("Aligning lyrics to audio…")
+                result = _model.align(audio_path, "\n".join(plain_lines), language="en")
 
-                def _cw(s):
-                    return _re3.sub(r"[^a-z0-9]", " ", s.lower()).split()
+                # ── Step 2: also transcribe to get fine word timestamps ───────────────
+                _status("Refining word timestamps…")
+                try:
+                    t_result = _model.transcribe(
+                        audio_path, language="en", word_timestamps=True,
+                        initial_prompt="\n".join(plain_lines[:10]),
+                        vad_filter=True)
+                    t_segs = t_result.segments if hasattr(t_result, "segments") else []
+                    t_words = []
+                    for _seg in t_segs:
+                        for _w in (_seg.words or []):
+                            _wt = getattr(_w, "start", None)
+                            _ww = getattr(_w, "word", "").strip()
+                            if _wt is not None and _ww:
+                                t_words.append((_wt, _ww))
+                    log(f"  [align] transcription gave {len(t_words)} words")
+                except Exception as _te:
+                    t_words = []
+                    log(f"  [align] transcription step failed ({_te}), using alignment only")
 
-                flat = [(t, tok) for (t, w) in all_words for tok in _cw(w)]
+                # ── Step 3: extract word timestamps from alignment result ─────────────
+                a_segs = result.segments if hasattr(result, "segments") else []
+                a_words = []
+                for _seg in a_segs:
+                    for _w in (_seg.words or []):
+                        _wt = getattr(_w, "start", None)
+                        _ww = getattr(_w, "word", "").strip()
+                        if _wt is not None and _ww:
+                            a_words.append((_wt, _ww))
+                log(f"  [align] alignment gave {len(a_words)} words")
+
+                # Prefer transcription words (more accurate timing); fall back to alignment
+                all_words = t_words if len(t_words) >= len(a_words) * 0.6 else a_words
+                log(f"  [align] using {'transcription' if all_words is t_words else 'alignment'} timestamps")
+
+                if not all_words:
+                    root.after(0, lambda: messagebox.showerror("No timestamps",
+                        "Could not get word timestamps — vocals may be too unclear."))
+                    root.after(0, lambda: _ts_btn_var.set("\U0001f3a4 Get AI Timestamps"))
+                    root.after(0, lambda: _ts_btn.configure(state="normal"))
+                    return
+
+                # ── Step 4: anchor each lyric line to the audio ───────────────────────
+                # Match each lyric line to the word stream by CONTENT with a forward-only
+                # sliding window, instead of mapping stable-ts segments to lines by blind
+                # index. Index mapping silently drifts whenever the number of segments
+                # differs from the number of lyric lines (very common), which is what
+                # made later lines progressively wrong. Content matching against the
+                # VAD-filtered transcription words also pins the first line to the real
+                # vocal onset, so long instrumental intros no longer drag everything early.
+                def _cw(s): return _re3.sub(r"[^a-z0-9]", " ", s.lower()).split()
+                flat = [(t, _cw(w)[0]) for (t, w) in all_words if _cw(w)]
                 lrc_pairs = []
                 search_from = 0
+                last_t = 0.0
                 for line in plain_lines:
                     lw = _cw(line)
                     if not lw:
+                        lrc_pairs.append((last_t, line))
                         continue
-                    n = len(lw)
+                    n_match = min(4, len(lw))
+                    window_end = min(len(flat), search_from + max(80, len(lw) * 14))
                     best_score, best_pos = -1, search_from
-                    # Search window: don't let n push limit below search_from
-                    limit = max(search_from + 1, len(flat) - n + 1)
-                    for i in range(search_from, min(limit, len(flat))):
-                        avail = len(flat) - i
-                        window = [flat[i + j][1] for j in range(min(n, avail))]
-                        score  = sum(1 for a, b in zip(window, lw) if a == b)
-                        if score > best_score:
-                            best_score, best_pos = score, i
-                            if score == n:
+                    for i in range(search_from, window_end):
+                        sc = sum(1 for j in range(n_match)
+                                 if i + j < len(flat) and flat[i + j][1] == lw[j])
+                        if sc > best_score:
+                            best_score, best_pos = sc, i
+                            if sc == n_match:
                                 break
-                    if best_pos < len(flat):
-                        lrc_pairs.append((flat[best_pos][0], line))
-                        search_from = best_pos + max(1, n // 2)
+                    t_hit = flat[best_pos][0] if best_pos < len(flat) else last_t
+                    if t_hit < last_t:          # keep cues non-decreasing (monotonic)
+                        t_hit = last_t
+                    last_t = t_hit
+                    lrc_pairs.append((t_hit, line))
+                    if best_score > 0:          # only advance the window on a real match
+                        search_from = best_pos + max(1, len(lw) - 1)
+                log(f"  [align] anchored {len(lrc_pairs)} lines to {len(flat)} aligned words")
 
                 if not lrc_pairs:
-                    root.after(0, lambda: messagebox.showerror(
-                        "No match", "Could not align lyrics — vocals may be unclear."))
-                    root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
+                    root.after(0, lambda: messagebox.showerror("No match", "Alignment returned no results."))
+                    root.after(0, lambda: _ts_btn_var.set("\U0001f3a4 Get AI Timestamps"))
                     root.after(0, lambda: _ts_btn.configure(state="normal"))
                     return
 
-                # 6. Write .lrc alongside the .txt
-                # Apply a small calibration offset: Whisper word.start tends to lag
-                # behind the actual vocal onset by ~0.15 s.
-                WHISPER_CALIB = 0.15
                 lrc_dest = os.path.splitext(lyrics_path)[0] + ".lrc"
-                with open(lrc_dest, "w", encoding="utf-8") as f:
+                with open(lrc_dest, "w", encoding="utf-8") as _of:
                     for (t, txt) in lrc_pairs:
-                        t2 = max(0.0, t - WHISPER_CALIB)
-                        m2 = int(t2) // 60
-                        s2 = t2 - m2 * 60
-                        f.write(f"[{m2:02d}:{s2:05.2f}]{txt}\n")
+                        t2 = max(0.0, t); m2 = int(t2) // 60; s2 = t2 - m2 * 60
+                        _of.write(f"[{m2:02d}:{s2:05.2f}]{txt}\n")
 
                 root.after(0, lambda: vars_["lyrics"].set(lrc_dest))
-                root.after(0, lambda: _ts_btn_var.set(f"✓ {len(lrc_pairs)} lines timestamped"))
+                root.after(0, lambda: _ts_btn_var.set(f"\u2713 {len(lrc_pairs)} lines timestamped"))
                 root.after(0, lambda: _ts_btn.configure(state="normal"))
-                log(f"  [whisper] ✓ Saved {lrc_dest}")
+                log(f"  [align] \u2713 Saved {lrc_dest} ({len(lrc_pairs)} lines)")
 
             except Exception as _e:
                 import traceback as _tb2
-                root.after(0, lambda: messagebox.showerror("Whisper error", str(_e)))
-                root.after(0, lambda: _ts_btn_var.set("🎙 Get AI Timestamps"))
+                root.after(0, lambda: messagebox.showerror("Alignment error", str(_e)))
+                root.after(0, lambda: _ts_btn_var.set("\U0001f3a4 Get AI Timestamps"))
                 root.after(0, lambda: _ts_btn.configure(state="normal"))
-                log(f"  [whisper] Error: {_e}\n{_tb2.format_exc()}")
+                log(f"  [align] Error: {_e}\n{_tb2.format_exc()}")
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -4207,15 +4432,32 @@ def run_gui():
     # Volume slider
     styled(tk.Label(sv_act, text="🔊", font=("Segoe UI", 11)), bg="surface").pack(side="left", padx=(12, 2))
     _sv_vol_var = tk.IntVar(value=70)
-    def _on_vol_change(*_):
-        _sv["vol"] = _sv_vol_var.get()
-        if _sv["t0"] is not None:      # restart playback so volume takes effect
+    _vol_pending = [None]   # pending throttled-restart timer id
+    def _vol_restart_now():
+        _vol_pending[0] = None
+        if _sv["t0"] is not None:               # only if something is playing
             off = _sv_elapsed()
             _sv_stop()
             _sv["offset"] = off
-            root.after(80, _sv_play)
+            root.after(15, _sv_play)
+    def _on_vol_change(*_):
+        # ffplay's volume is fixed at launch, so a live preview means relaunching.
+        # Throttle that to ~once every 250ms while dragging: the volume tracks the
+        # slider without the every-pixel thrash that froze playback before.
+        _sv["vol"] = int(float(_sv_vol_var.get()))
+        if _sv["t0"] is None or _vol_pending[0] is not None:
+            return                               # not playing, or a restart is queued
+        _vol_pending[0] = root.after(250, _vol_restart_now)
+    def _apply_vol(*_):
+        # On release, apply the final value immediately (cancel any queued restart).
+        if _vol_pending[0] is not None:
+            try: root.after_cancel(_vol_pending[0])
+            except Exception: pass
+            _vol_pending[0] = None
+        _vol_restart_now()
     sv_vol_scale = ttk.Scale(sv_act, from_=0, to=100, orient="horizontal",
-                             variable=_sv_vol_var, length=100, command=_on_vol_change)
+                             variable=_sv_vol_var, length=120, command=_on_vol_change)
+    sv_vol_scale.bind("<ButtonRelease-1>", _apply_vol)
     sv_vol_scale.pack(side="left", padx=(0, 12))
 
     tk.Button(sv_act, text="✓  Build & Export PSARC",
@@ -4901,9 +5143,10 @@ def run_gui():
         # Prefer YouTube-sourced values (set by _confirm before _trigger_automagic)
         # over GP file metadata which is often truncated or wrong
         _yt_c = _yt_meta_cache[0]
-        _sk_artist = (_yt_c.get("artist") or vars_["artist"].get()).strip() or "Unknown"
-        _sk_title  = (_yt_c.get("title")  or vars_["title"].get()).strip()  or "Unknown"
+        _sk_artist = (vars_["artist"].get().strip() or _yt_c.get("artist", "")).strip() or "Unknown"
+        _sk_title  = (vars_["title"].get().strip()  or _yt_c.get("title",  "")).strip()  or "Unknown"
         song_key  = f"{_safe_fn(_sk_artist)}_{_safe_fn(_sk_title)}"
+        _sv["song_key"] = song_key
         song_dir  = os.path.join(out_dir, song_key)
         os.makedirs(song_dir, exist_ok=True)
 
@@ -4927,11 +5170,35 @@ def run_gui():
                         urllib.request.urlretrieve(_hires, _art_path)
                         root.after(0, lambda p=_art_path: vars_["art"].set(p))
                         log("  [art] ✓ Cover art downloaded from iTunes")
-                    # Auto-fill album name if still blank or generic
+                    # Auto-correct title from iTunes — GP files are often truncated/wrong.
+                    # iTunes trackName is authoritative for commercial releases.
+                    _itunes_track = _hit.get("trackName", "").strip()
+                    if _itunes_track:
+                        _cur_title = vars_["title"].get().strip()
+                        if not _cur_title or len(_itunes_track) > len(_cur_title):
+                            root.after(0, lambda t=_itunes_track: vars_["title"].set(t))
+                            log("  [art] ✓ Title corrected from iTunes: " + _itunes_track)
+                    # Auto-fill artist from iTunes if blank
+                    _itunes_artist = _hit.get("artistName", "").strip()
+                    if _itunes_artist:
+                        _cur_artist = vars_["artist"].get().strip()
+                        if not _cur_artist:
+                            root.after(0, lambda a=_itunes_artist: vars_["artist"].set(a))
+                            log("  [art] ✓ Artist from iTunes: " + _itunes_artist)
+                    # Auto-fill album name if still blank or generic.
+                    # Strip trailing "- Single" / "- EP" — iTunes marks standalone
+                    # releases this way but the in-game field should show the real album.
+                    import re as _re_alb
                     _itunes_album = _hit.get("collectionName", "").strip()
+                    _itunes_album = _re_alb.sub(
+                        r'\s*[-–]\s*(Single|EP|Deluxe.*|Remaster.*|Live.*|Acoustic.*)$',
+                        "", _itunes_album, flags=_re_alb.IGNORECASE).strip()
                     if _itunes_album:
                         _cur_album = vars_["album"].get().strip()
-                        if not _cur_album or _cur_album.lower() in ("single", "unknown", ""):
+                        _cur_clean  = _re_alb.sub(
+                            r'\s*[-–]\s*(Single|EP)$', "", _cur_album,
+                            flags=_re_alb.IGNORECASE).strip()
+                        if not _cur_clean or _cur_clean.lower() in ("single", "unknown", ""):
                             root.after(0, lambda a=_itunes_album: vars_["album"].set(a))
                             log("  [art] ✓ Album: " + _itunes_album)
             except Exception as _ae:
@@ -5029,14 +5296,18 @@ def run_gui():
                     log(f"  [fetch] Strategy client={_client} fmt={_fmt} failed: "
                         f"{_stderr_txt[-200:]}")
 
-                # Find the downloaded file — prefer .wav, accept any song_key file as fallback
+                # Find the downloaded audio file. Restrict to AUDIO extensions only:
+                # the song folder also holds .lrc/.txt/.dlc.xml/.dds, and a loose
+                # "any song_key* file" match grabs the .lrc as if it were the audio
+                # (it sorts before .opus), which then breaks the previewer and build.
+                _AUD_EXTS = (".wav", ".mp3", ".m4a", ".webm", ".opus", ".ogg", ".flac", ".aac")
                 raw_audio = None
                 for f in sorted(os.listdir(dest_dir)):
-                    if f.startswith(song_key) and f.endswith(".wav"):
+                    if f.startswith(song_key) and f.lower().endswith(".wav"):
                         raw_audio = os.path.join(dest_dir, f); break
                 if not raw_audio:
                     for f in sorted(os.listdir(dest_dir)):
-                        if f.startswith(song_key) and not f.endswith(".part"):
+                        if f.startswith(song_key) and f.lower().endswith(_AUD_EXTS):
                             raw_audio = os.path.join(dest_dir, f); break
 
                 if not raw_audio or not os.path.exists(raw_audio):
@@ -5044,7 +5315,7 @@ def run_gui():
                     log(f"  [fetch] yt-dlp stderr: {err_detail}")
                     any_audio = None
                     for f in sorted(os.listdir(dest_dir)):
-                        if f.startswith(song_key) and not f.endswith(".part"):
+                        if f.startswith(song_key) and f.lower().endswith(_AUD_EXTS):
                             any_audio = os.path.join(dest_dir, f); break
                     if any_audio and ffmpeg:
                         root.after(0, lambda: _safe_status("Converting audio to WAV..."))
@@ -5096,10 +5367,15 @@ def run_gui():
 
                 # Fetch synced lyrics from lrclib.net
                 try:
-                    # Use YouTube-sourced artist/title (cached in _confirm), not GP metadata
+                    # Use the longest/best title across: UI field (may be iTunes-corrected by now),
+                    # YouTube cache. Longer string wins — GP metadata is often truncated.
                     _yt_cache = _yt_meta_cache[0]
-                    o_artist = (_yt_cache.get("artist") or vars_["artist"].get()).strip()
-                    o_title  = (_yt_cache.get("title")  or vars_["title"].get()).strip()
+                    _ui_artist = vars_["artist"].get().strip()
+                    _ui_title  = vars_["title"].get().strip()
+                    _yt_artist = _yt_cache.get("artist", "")
+                    _yt_title  = _yt_cache.get("title",  "")
+                    o_artist = (_ui_artist if len(_ui_artist) >= len(_yt_artist) else _yt_artist).strip()
+                    o_title  = (_ui_title  if len(_ui_title)  >= len(_yt_title)  else _yt_title ).strip()
                     root.after(0, lambda: _safe_status("Fetching lyrics…"))
                     log(f"  [fetch] Looking up lyrics: artist='{o_artist}' title='{o_title}'")
                     _LRCLIB_HDR = {"User-Agent": "gp2rs-studio/2.0"}
@@ -5112,24 +5388,37 @@ def run_gui():
                         def _n(s): return re.sub(r"[^a-z0-9 ]", "", s.lower())
                         return _dl.SequenceMatcher(None, _n(a), _n(b)).ratio()
 
+                    # Version qualifiers that indicate a different recording
+                    _VERSION_TAGS = re.compile(
+                        r'(redux|remix|remixed|live|acoustic|demo|instrumental|'
+                        r'cover|karaoke|remaster|remastered|radio.?edit|edit|'
+                        r'extended|stripped|version|ver\.?)', re.IGNORECASE)
+
+                    def _has_version_tag(s):
+                        return bool(_VERSION_TAGS.search(s))
+
                     def _lrc_best_match(results, artist, title):
                         """Pick the best synced-lyrics result.
-                        Name similarity is the primary key; among close matches,
-                        prefer whichever has the most lyrics (lines count)."""
+                        Name similarity is the primary key; penalize results with
+                        version qualifiers (Redux, Remix, Live, etc.) not present
+                        in the search title; prefer more lines on ties."""
+                        search_has_tag = _has_version_tag(title)
                         best_score, best_item = 0.0, None
                         for item in results:
                             if not item.get("syncedLyrics"):
                                 continue
+                            track_name = item.get("trackName", "")
                             sc = (_fuzzy(item.get("artistName",""), artist) +
-                                  _fuzzy(item.get("trackName",""), title))
-                            # Tiebreak: prefer more complete lyrics (more lines)
+                                  _fuzzy(track_name, title))
+                            # Penalise results that add a version qualifier the search
+                            # title doesn't have — they're a different recording.
+                            if not search_has_tag and _has_version_tag(track_name):
+                                sc *= 0.6
                             cur_lines  = len((best_item or {}).get("syncedLyrics","").splitlines()) if best_item else 0
                             this_lines = len(item["syncedLyrics"].splitlines())
                             if sc > best_score + 0.1:
-                                # Clearly better name match — always prefer
                                 best_score, best_item = sc, item
                             elif sc >= best_score - 0.1 and this_lines > cur_lines:
-                                # Similar name match but more lyrics — prefer this one
                                 best_score, best_item = sc, item
                         return best_item, best_score
 
@@ -5310,6 +5599,7 @@ def run_gui():
     # ══════════════════════════════════════════════════════════════════════
     player_bar = styled(tk.Frame(root, height=114), bg="card2")
     player_bar.grid(row=1, column=0, columnspan=2, sticky="ew")
+    player_bar.grid_remove()  # hidden until startup overlay dismissed
     player_bar.grid_propagate(False)
 
     # ── Timeline scrubber ──────────────────────────────────────────────────
@@ -5730,7 +6020,7 @@ def run_gui():
     # ══ LOAD GP ════════════════════════════════════════════════════════════════════════════════════════
     def load_gp(path, _keep_media=False):
         vars_["gp"].set(path)
-        startup_overlay.place_forget()
+        startup_overlay.place_forget(); player_bar.grid()
         for w in arr_grid.winfo_children(): w.destroy()
         track_rows.clear()
         if not _keep_media:
@@ -5861,6 +6151,7 @@ def run_gui():
                 o = SimpleNamespace(
                     gp_path       = vars_["gp"].get(),
                     audio_path    = vars_["audio"].get(),
+                    preview_path  = vars_["preview_audio"].get(),
                     lyrics_path   = vars_["lyrics"].get(),
                     art_path      = vars_["art"].get(),
                     out_dir       = vars_["out"].get(),
@@ -5878,7 +6169,8 @@ def run_gui():
                     pitch         = float(vars_["pitch"].get() or 0),
                     bpm_factor    = float(vars_["bpm_factor"].get() or 1.0),
                     lrc_offset    = float(vars_["lrc_offset"].get() or 0.0),
-                    use_psarc     = bool(psarc_var.get()),
+                    song_folder   = _sv.get("song_key", ""),
+                    make_psarc    = bool(psarc_var.get()),
                     use_ddc       = bool(use_ddc.get()),
                     tracks        = [{"index":      r["index"],
                                       "include":    r["var_include"].get(),
@@ -5889,13 +6181,37 @@ def run_gui():
                 def _prog(msg):
                     root.after(0, lambda m=msg: bld_status_var.set(m))
                     root.after(0, lambda m=msg: log("  " + m))
-                build_project(o, _prog)
+                result = build_project(o, _prog)
+                # Copy PSARC to the user-chosen output folder if set
+                _psarc_src = (result or {}).get("psarc", "")
+                _psarc_dest_dir = vars_["psarc_out"].get().strip() or vars_["out"].get().strip()
+                if _psarc_src and os.path.isfile(_psarc_src) and _psarc_dest_dir:
+                    os.makedirs(_psarc_dest_dir, exist_ok=True)
+                    _psarc_dest = os.path.join(_psarc_dest_dir, os.path.basename(_psarc_src))
+                    try:
+                        if os.path.abspath(_psarc_src) != os.path.abspath(_psarc_dest):
+                            shutil.copy2(_psarc_src, _psarc_dest)
+                        root.after(0, lambda d=_psarc_dest: log(f"  [psarc] Copied to: {d}"))
+                    except Exception as _ce:
+                        root.after(0, lambda e=_ce: log(f"  [psarc] Copy failed: {e}"))
+                _save_project_to_history(
+                    vars_["title"].get(), vars_["artist"].get(), vars_["gp"].get(),
+                    _psarc_src or None, vars_["art"].get() or None)
                 root.after(0, lambda: bld_status_var.set("✓ Build complete!"))
                 root.after(1500, _close_bld)
             except Exception as e:
+                _tb = traceback.format_exc()
                 root.after(0, lambda: log("BUILD ERROR: " + str(e)))
-                root.after(0, lambda: log(traceback.format_exc()))
-                root.after(0, lambda: messagebox.showerror("Build failed", str(e)))
+                root.after(0, lambda: log(_tb))
+                # Surface the crash location in the popup so it can be read/screenshotted
+                # without digging through the Log page.
+                _loc = ""
+                try:
+                    _frames = [ln.strip() for ln in _tb.splitlines() if ln.strip().startswith("File ")]
+                    if _frames: _loc = "\n\nCrash location:\n" + _frames[-1]
+                except Exception:
+                    pass
+                root.after(0, lambda m=(str(e) + _loc): messagebox.showerror("Build failed", m))
                 root.after(0, _close_bld)
             finally:
                 root.after(0, lambda: btn_rebuild.configure(
