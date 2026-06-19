@@ -1,10 +1,6 @@
 # RS Studio — Guitar Pro → Rocksmith 2014 CDLC Builder
 
-> **Turn any Guitar Pro 7/8 file into a playable Rocksmith 2014 CDLC in minutes.**
-
-RS Studio is a dark, sleek desktop app that automates the entire CDLC creation pipeline — from Guitar Pro tab to finished `.psarc` — with one-click audio fetching, AI lyric timestamping, live sync tuning, and automatic dependency management.
-
-📺 **[Watch tutorials and demos on YouTube → @Ynziepoo](https://www.youtube.com/@Ynziepoo)**
+> **Turn any Guitar Pro 7/8 file into a playable Rocksmith 2014 CDLC in minutes with no manual syncing**
 
 ---
 
@@ -17,7 +13,7 @@ Paste a YouTube URL and RS Studio downloads the audio, reads the video title to 
 Reads `.gp` (Guitar Pro 7/8) files directly. Extracts tempo maps, time signatures, notes, chords, bends, slides, hammer-ons/pull-offs, palm mutes, harmonics, vibrato, tremolo, sections, and more. Exports full Rocksmith 2014 arrangement XML (Lead, Rhythm, and Bass).
 
 **AI lyric timestamping**
-Uses [Whisper](https://github.com/openai/whisper) (via `faster-whisper` / `stable-ts`) to generate word-level timestamps and sync lyrics to audio automatically. RS Studio installs the AI model (~145 MB) on first use — no manual setup needed.
+Uses [Whisper](https://github.com/openai/whisper) (via `faster-whisper` / `stable-ts`) to generate word-level timestamps and sync lyrics to audio automatically. RS Studio installs the AI model (~145 MB) on first use — no manual setup needed. *****INWK********
 
 **Live Sync & Verify**
 Zoomable waveform viewer with a scrolling tab note overlay so you can see exactly where your notes land on the audio. Nudge the lead-in offset per-track, fine-tune BPM scaling, and adjust lyrics timing independently — all in real time before building.
