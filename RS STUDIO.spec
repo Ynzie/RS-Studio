@@ -1,15 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_submodules
 
-hiddenimports = ['gp2rs', 'PIL', 'PIL.Image', 'PIL.ImageTk', 'cst_template', 'wwise_convert']
+hiddenimports = ['gp2rs', 'PIL', 'PIL.Image', 'PIL.ImageTk', 'cst_template', 'wwise_convert', 'lyrics_align', 'lyric_sync']
 hiddenimports += collect_submodules('PIL')
 
 
 a = Analysis(
-    ['C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\gp2rs_studio.py'],
+    ['C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\gp2rs_studio.py'],
     pathex=[],
-    binaries=[('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\ffmpeg.exe', '.')],
-    datas=[('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\gp2rs.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\gp2rs_studio.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\cst_template.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\wwise_convert.py', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\rs_studio.ico', '.'), ('C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\rs_studio.png', '.')],
+    binaries=[('C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\ffmpeg.exe', '.')],
+    datas=[('C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\gp2rs.py', '.'), ('C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\gp2rs_studio.py', '.'), ('C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\cst_template.py', '.'), ('C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\wwise_convert.py', '.'), ('C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\lyrics_align.py', '.'), ('C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\lyric_sync.py', '.'), ('C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\rs_studio.ico', '.'), ('C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\rs_studio.png', '.')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -39,5 +39,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Users\\ynzer\\Downloads\\python thing\\RS Studio\\rs_studio.ico'],
+    icon=['C:\\Users\\ynzer\\Downloads\\RS-Studio-main\\rs_studio.ico'],
 )

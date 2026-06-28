@@ -784,7 +784,31 @@ def lyrics_txt_to_vocals(path, gp, leadin):
     return "\n".join(out)
 
 
-def lrc_to_vocals(path, leadin=0.0, lrc_offset=0.0):
+def warp_time(t, anchors):
+    """Charter-style piecewise-linear time warp. `anchors` is a list of
+    (orig_t, new_t) pairs; times between anchors are linearly interpolated, and
+    times outside the range are shifted by the nearest anchor's delta. Used to
+    re-time lyrics after the user drags individual cues without disturbing the
+    rest."""
+    if not anchors:
+        return t
+    pts = sorted((float(o), float(n)) for o, n in anchors)
+    if t <= pts[0][0]:
+        return t + (pts[0][1] - pts[0][0])
+    if t >= pts[-1][0]:
+        return t + (pts[-1][1] - pts[-1][0])
+    for i in range(1, len(pts)):
+        o0, n0 = pts[i - 1]
+        o1, n1 = pts[i]
+        if o0 <= t <= o1:
+            if o1 == o0:
+                return n1
+            f = (t - o0) / (o1 - o0)
+            return n0 + (n1 - n0) * f
+    return t
+
+
+def lrc_to_vocals(path, leadin=0.0, lrc_offset=0.0, warp_anchors=None):
     """Synced .lrc -> Rocksmith vocals XML (words spread evenly across each line).
 
     .lrc timestamps are relative to the ORIGINAL (un-padded) audio, i.e. t=0 is
@@ -799,8 +823,10 @@ def lrc_to_vocals(path, leadin=0.0, lrc_offset=0.0):
         m = rx.match(raw.strip())
         if not m:
             continue
-        t = int(m.group(1)) * 60 + float(m.group(2)) + leadin + lrc_offset
-        t = max(0.0, t)
+        t0 = int(m.group(1)) * 60 + float(m.group(2))
+        if warp_anchors:
+            t0 = warp_time(t0, warp_anchors)
+        t = max(0.0, t0 + leadin + lrc_offset)
         txt = m.group(3).strip()
         lines.append((t, txt))
     lines.sort()
@@ -811,10 +837,12 @@ def lrc_to_vocals(path, leadin=0.0, lrc_offset=0.0):
         end = lines[i + 1][0] if i + 1 < len(lines) else t + 4.0
         words = txt.split()
         span = max(0.5, (end - t) - 0.2)
-        step = span / max(1, len(words))
+        # Cap word spacing: if there's a long gap to the next line, don't smear the
+        # words across the whole gap (that makes each word hang on screen forever).
+        step = min(span / max(1, len(words)), 0.5)
         for w, word in enumerate(words):
             mark = word + ("+" if w == len(words) - 1 else "")
-            vocals.append((t + w * step, min(step * 0.9, 2.0), mark))
+            vocals.append((t + w * step, min(step * 0.9, 1.4), mark))
     out = ['<?xml version="1.0" encoding="UTF-8"?>', f'<vocals count="{len(vocals)}">']
     for t, ln, w in vocals:
         out.append(f'  <vocal time="{f3(t)}" note="254" length="{f3(ln)}" lyric="{xml_escape(w)}"/>')

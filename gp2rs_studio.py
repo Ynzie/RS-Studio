@@ -2291,6 +2291,39 @@ def run_gui():
 
         def _worker():
             try:
+                # ── NEW: route through the demucs/energy-VAD engine ───────────
+                # lyric_sync isolates vocals (demucs), times the lyric LINES from
+                # the stem's phrase onsets (energy VAD — no CUDA), and only falls
+                # back to whisper if VAD can't run. It keeps the real lyric words
+                # and writes the .lrc itself.
+                import importlib as _il3
+                _il3.invalidate_caches()
+                try:
+                    import lyric_sync as _ls
+                    _il3.reload(_ls)
+                except Exception as _imp:
+                    root.after(0, lambda: messagebox.showerror("Engine missing",
+                        f"lyric_sync.py / lyrics_align.py not found next to the app:\n{_imp}"))
+                    root.after(0, lambda: _ts_btn_var.set("\U0001f3a4 Get AI Timestamps"))
+                    root.after(0, lambda: _ts_btn.configure(state="normal"))
+                    return
+                _wd = os.path.join(os.path.dirname(lyrics_path) or ".", "_align_work")
+                _res = _ls.align_lyrics(audio_path, lyrics_path, _wd, log, _status)
+                if not _res:
+                    root.after(0, lambda: messagebox.showerror("No timestamps",
+                        "Could not time the lyrics — the vocals may be too unclear, "
+                        "or no lyric lines were found in the .txt file."))
+                    root.after(0, lambda: _ts_btn_var.set("\U0001f3a4 Get AI Timestamps"))
+                    root.after(0, lambda: _ts_btn.configure(state="normal"))
+                    return
+                _lrc_dest = _res["lrc"]; _n = _res["lines"]; _src = _res.get("source", "?")
+                root.after(0, lambda: vars_["lyrics"].set(_lrc_dest))
+                root.after(0, lambda: _ts_btn_var.set(f"✓ {_n} lines timestamped ({_src})"))
+                root.after(0, lambda: _ts_btn.configure(state="normal"))
+                log(f"  [align] ✓ Saved {_lrc_dest} ({_n} lines, source={_src})")
+                return
+                # ─── legacy in-process stable-whisper path (kept as reference,
+                #     unreachable after the return above) ───────────────────────
                 import re as _re3
                 _status("Loading aligner…")
                 _st = None
