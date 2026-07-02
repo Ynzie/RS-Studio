@@ -1,42 +1,65 @@
-# ── Build output ──────────────────────────────────────────
-dist/
-build/
-*.spec
+# ============================================================================
+# RS Studio — WHITELIST .gitignore
+# Ignore EVERYTHING by default, then explicitly allow source files. This keeps
+# the repo clean no matter what lands in the folder (PyInstaller build/dist,
+# downloaded ffmpeg/yt-dlp, generated song-project folders, audio, .psarc, etc.).
+#
+# >>> If you add a NEW source file, add a matching "!/<file>" line below or it
+#     will NOT be committed. <<<
+# ============================================================================
 
-# ── Python cache ──────────────────────────────────────────
+# Ignore every top-level entry...
+/*
+
+# ...then un-ignore the things that belong in the repo:
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/RS STUDIO.spec
+!/build_exe.bat
+!/_build_helper.py
+
+# Python source
+!/gp2rs.py
+!/gp2rs_studio.py
+!/lyrics_align.py
+!/lyric_sync.py
+!/lyric_font.py
+!/cst_template.py
+!/wwise_convert.py
+!/tone_designer.py
+!/gp_convert.py
+
+# PDF tab import (pdf2gp): turns Ultimate Guitar print-to-PDF tabs into a .gp5
+!/pdf2gp.py
+!/staffdet.py
+!/tabrec.py
+!/digit_templates.npz
+!/sig_templates.npz
+
+# App icons / assets
+!/rs_studio.ico
+!/rs_studio.png
+
+# Wwise project templates needed by wwise_convert.py (wav -> wem without CST)
+!/wwise_templates/
+
+# Built DLC Builder packer (committed so the app ships ready-to-run)
+!/RSDDC_Build2/
+# ...but never its rebuildable intermediates if you ever build it in-place
+RSDDC_Build2/bin/
+RSDDC_Build2/obj/
+
+# ----------------------------------------------------------------------------
+# Belt-and-suspenders: even if something above is loose, or a whitelisted
+# folder generates junk of its own, catch these patterns everywhere so they
+# never sneak into a commit.
+# ----------------------------------------------------------------------------
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-
-# ── Bundled binaries (too large for git; build_exe.bat fetches them) ──
-ffmpeg.exe
-ffplay.exe
-yt-dlp.exe
-
-# ── Oversized source assets ───────────────────────────────
-icon.png
-
-# ── User-specific runtime data ────────────────────────────
-settings.json
-
-# ── Junk / scratch ────────────────────────────────────────
-New folder/
-DeadPoetSocietyCoDa/
-"wav)"
-*.tmp
-*.log
-01-Screenshot*
-
-# ── OS files ──────────────────────────────────────────────
-Thumbs.db
+build/
+dist/
+*.spec.bak
 .DS_Store
-/build
-/build/RS STUDIO
-/build
-/build/RS STUDIO
-/dist
-build/RS STUDIO/RS STUDIO.pkg
-/dist
-dist/RS STUDIO.exe
-/Vibe_Music_The_Incurable_Romantic
-/DLCBuilder Source
+Thumbs.db

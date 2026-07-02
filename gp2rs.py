@@ -27,6 +27,84 @@ from fractions import Fraction
 
 STD_TUNING = [40, 45, 50, 55, 59, 64]  # EADGBE low->high (6 string)
 STD_BASS = [28, 33, 38, 43]            # EADG bass
+
+# Note names for the root pitch of the low string (used by tuning_name()).
+_PITCH_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+
+# Named 6-string alternate-tuning *shapes*, as semitone offsets from standard
+# EADGBE (low to high). These are well-established, conventionally-fixed
+# voicings (unlike e.g. "Open A" where different charts disagree on the exact
+# strings), so they're safe to label confidently. Each shape can still sit at
+# any overall transposition (e.g. "Open D" up a step is still recognizably
+# the Open D *shape*, just like "Drop D" up a step becomes "Drop E") — we
+# detect the shape, then name the root off the lowest string actually heard.
+_NAMED_SHAPES = [
+    # (offsets relative to EADGBE, semitones from the LOW STRING up to the
+    # tuning's actual named root, name template; {root} = that root's name).
+    # The named root isn't always the low string — e.g. Open G's low string
+    # rings D (a 4th below the G major chord's root) by slide-guitar
+    # convention, so it needs its own offset rather than reusing the low
+    # string's pitch directly like Standard/Drop tunings do.
+    ([-2, 0, 0, 0, 0, -2], 0, "Double Drop {root}"),
+    # Open D shape (D A D F# A D), root = low string. Transposed +2 this is
+    # also Open E (E B E G# B E) — one entry covers both via the
+    # transposition search below; no separate "Open E" pattern needed.
+    ([-2, 0, 0, -1, -2, -2], 0, "Open {root}"),
+    # Open G shape (D G D G B D): low string is D, root is G, a 4th above.
+    ([-2, -2, 0, 0, 0, -2], 5, "Open {root}"),
+    ([-2, 0, 0, 0, -2, -2], 0, "DADGAD"),
+]
+
+
+def tuning_name(tuning, is_bass=False):
+    """Map an absolute MIDI tuning list to a human-readable tuning name for
+    upload purposes (e.g. 'E Standard', 'Eb Standard', 'Drop D', 'Drop C#',
+    'Double Drop D', 'Open D', 'Open G', 'Open E', 'DADGAD').
+    Falls back to 'Custom' when it doesn't match a known shape.
+
+    `tuning` is the per-string MIDI list, low string first (as GP/RS store it).
+    Note: only exact 6-string sets are checked against the alternate-tuning
+    shapes below (7/8-string extended-range guitars fall back to Custom for
+    those, same as before — they're still correctly detected as Standard/Drop
+    if every string except the low one(s) matches).
+    """
+    if not tuning:
+        return "Custom"
+    ref = STD_BASS if is_bass else STD_TUNING
+    n = min(len(ref), len(tuning))
+    if n < (4 if is_bass else 6):
+        return "Custom"
+    offs = [tuning[i] - ref[i] for i in range(n)]
+
+    # All strings shifted by the same amount -> "<root> Standard".
+    if len(set(offs)) == 1:
+        semis = offs[0]
+        if semis == 0:
+            return "E Standard"
+        root_midi = (STD_BASS[0] if is_bass else STD_TUNING[0]) + semis
+        root = _PITCH_NAMES[root_midi % 12]
+        return f"{root} Standard"
+
+    # Drop tunings: low string is 2 semitones below the rest, which are uniform.
+    upper = offs[1:]
+    if len(set(upper)) == 1 and offs[0] == upper[0] - 2:
+        low_midi = (STD_BASS[0] if is_bass else STD_TUNING[0]) + offs[0]
+        root = _PITCH_NAMES[low_midi % 12]
+        return f"Drop {root}"
+
+    # Named alternate-tuning shapes (guitar only — these are 6-string voicings).
+    if not is_bass and n == 6 and len(tuning) == 6:
+        for i in range(-3, 4):  # allow the whole shape to sit anywhere nearby
+            shifted = [o - i for o in offs]
+            for shape, root_offset, template in _NAMED_SHAPES:
+                if shifted == shape:
+                    root_midi = STD_TUNING[0] + offs[0] + root_offset
+                    root = _PITCH_NAMES[root_midi % 12]
+                    return template.format(root=root)
+
+    return "Custom"
+
 NOTE_VALUES = {"Whole": 4, "Half": 2, "Quarter": 1, "Eighth": Fraction(1, 2),
                "16th": Fraction(1, 4), "32nd": Fraction(1, 8), "64th": Fraction(1, 16),
                "128th": Fraction(1, 32)}
@@ -68,8 +146,19 @@ class Prop:
         return k in self.d
 
 
+# Guitar Pro's gpif format stores explicit left-hand fingering (when the tab
+# author set it) as a "LeftFingering" property with text matching PyGuitarPro's
+# Fingering enum names. Map to Rocksmith chordTemplate finger numbers: 1-4 are
+# unambiguous (index/middle/ring/pinky); thumb's exact numeric encoding isn't
+# independently confirmed from a real Rocksmith chordTemplate sample, so 0 is
+# a best-effort choice — chord_fingers() logs the first time it's used so it's
+# easy to spot and verify in-game if it looks wrong.
+_GP_FINGER_MAP = {"Open": -1, "NoFinger": -1, "Thumb": 0,
+                   "Index": 1, "Middle": 2, "Annular": 3, "Little": 4}
+
+
 class GPNote:
-    __slots__ = ("string", "fret", "props", "tie_dest", "tie_orig", "accent")
+    __slots__ = ("string", "fret", "props", "tie_dest", "tie_orig", "accent", "finger")
 
     def __init__(self, el):
         self.props = Prop(el.find("Properties"))
@@ -80,6 +169,7 @@ class GPNote:
         self.tie_orig = tie is not None and tie.get("origin") == "true"
         acc = el.findtext("Accent")
         self.accent = bool(acc and int(acc) & 0x08 or el.find("Accent") is not None)
+        self.finger = _GP_FINGER_MAP.get(self.props.get("LeftFingering"))
 
 
 class GPBeat:
@@ -255,6 +345,7 @@ class RSNote:
     def __init__(self, t, dur, gpn, beat):
         self.time, self.dur = t, dur
         self.string, self.fret = gpn.string, gpn.fret
+        self.finger = gpn.finger  # explicit GP fingering, if the tab author set it
         p = gpn.props
         self.palm = "PalmMuted" in p
         self.mute = "Muted" in p
@@ -290,7 +381,7 @@ class RSNote:
         self.max_bend = max((v for _, v in self.bend_pts), default=0)
 
 
-def convert_track(gp, ti, leadin, sustain_min=0.40, bpm_scale=1.0):
+def convert_track(gp, ti, leadin, sustain_min=None, bpm_scale=1.0):
     beats, bar_times = gp.track_beats(ti, leadin, bpm_scale=bpm_scale)
     tun = gp.tuning(ti)
     eff, dropped = gp.effective_tuning(ti)
@@ -347,68 +438,201 @@ def convert_track(gp, ti, leadin, sustain_min=0.40, bpm_scale=1.0):
         elif n.slide_flags & 0b1000:  # slide out up
             n.uslide_to = min(24, n.fret + 4)
         nxt_on_string[n.string] = n
-    # sustains
+    # CF charting standard: each sustain must leave at least a 1/32-note gap before
+    # the next note on the SAME string, so sustains never visually run into the
+    # following note. Trim (never extend) to honour that gap.
+    def _bpm_at(t):
+        bpm = 120.0
+        for bt in bar_times:
+            if bt[0] <= t:
+                bpm = bt[2] or bpm
+            else:
+                break
+        return bpm or 120.0
+
+    def _bar_dur_at(t):
+        """Length of a full measure (in seconds) at time t, e.g. 4 beats at the
+        prevailing BPM/time-signature for a 4/4 bar — used as the sustain-trim
+        threshold so it's correct at any tempo, not a single flat cutoff."""
+        quarters, bpm = 4.0, 120.0
+        for bt in bar_times:
+            if bt[0] <= t:
+                quarters, bpm = bt[1] or quarters, bt[2] or bpm
+            else:
+                break
+        return (quarters * 60.0 / bpm) if bpm else 2.0
+
+    # sustains: a note's sustain is only worth SHOWING if it lasts at least one
+    # full bar (the CDLC community standard — shorter sustains just clutter
+    # the highway) — UNLESS the note has a technique that needs a visible
+    # sustain regardless of length (bend, slide, tremolo, vibrato).
+    # `sustain_min`, if explicitly passed, overrides the bar-relative
+    # threshold with a flat one (kept for callers/tests that want that).
     for n in notes:
         need = n.bend_pts or n.slide_to > 0 or n.uslide_to > 0 or n.tremolo or n.vibrato
-        n.sustain = n.dur if (n.dur >= sustain_min or need) else 0.0
+        thresh = sustain_min if sustain_min is not None else _bar_dur_at(n.time)
+        n.sustain = n.dur if (n.dur >= thresh or need) else 0.0
+
+    by_string = {}
+    for n in notes:
+        by_string.setdefault(n.string, []).append(n)
+    for ns in by_string.values():
+        ns.sort(key=lambda x: x.time)
+        for i in range(len(ns)):
+            cur = ns[i]
+            nxt = ns[i + 1] if i + 1 < len(ns) else None
+            if cur.link_next:
+                # linkNext needs a real, adjacent next note on this string to
+                # link into; otherwise DLC Builder flags it. Connect the sustain
+                # to it (no 1/32 gap) and align the slide target to its fret.
+                if nxt is None or (nxt.time - (cur.time + cur.dur)) > 2.0:
+                    cur.link_next = False
+                    if cur.slide_to > 0:
+                        cur.uslide_to = cur.slide_to
+                        cur.slide_to = -1
+                    continue
+                cur.sustain = max(cur.sustain, round(nxt.time - cur.time, 3))
+                if cur.slide_to > 0 and nxt.fret > 0:
+                    cur.slide_to = nxt.fret
+                continue
+            # normal notes: keep at least a 1/32-note gap before the next note
+            if cur.sustain > 0 and nxt is not None:
+                gap = (60.0 / _bpm_at(cur.time)) / 8.0
+                max_end = nxt.time - gap
+                if cur.time + cur.sustain > max_end:
+                    cur.sustain = max(0.0, max_end - cur.time)
     return notes, beats, bar_times
 
 
 def group_chords(notes):
-    """Group simultaneous notes into chords; returns (singles, chords, templates)."""
+    """Group simultaneous notes into chords; returns (singles, chords, templates,
+    finger_hints). finger_hints is a list parallel to templates: a 6-tuple of
+    explicit GP-authored fingers (-1/None where the tab didn't specify one),
+    used to override the chord_fingers() heuristic when available."""
     from collections import defaultdict
     by_time = defaultdict(list)
     for n in notes:
         by_time[round(n.time, 4)].append(n)
-    singles, chords, templates, tindex = [], [], [], {}
+    singles, chords, templates, finger_hints, tindex = [], [], [], [], {}
     for t in sorted(by_time):
         grp = sorted(by_time[t], key=lambda n: n.string)
         if len(grp) == 1:
             singles.append(grp[0])
             continue
         frets = [-1] * 6
+        hints = [None] * 6
         for n in grp:
             frets[n.string] = n.fret
+            hints[n.string] = n.finger
         key = tuple(frets)
         if key not in tindex:
             tindex[key] = len(templates)
             templates.append(key)
-        chords.append((grp[0].time, tindex[key], grp))
-    return singles, chords, templates
-
-
-def chord_fingers(frets):
-    """Crude but valid fingering heuristic for chord templates."""
-    fingers = [-1] * 6
-    fretted = sorted({f for f in frets if f > 0})
-    if not fretted:
-        return fingers
-    base = fretted[0]
-    barre = sum(1 for f in frets if f == base) > 1 and base == min(fretted)
-    for s, f in enumerate(frets):
-        if f <= 0:
-            continue
-        idx = f - base + 1
-        if barre and f == base:
-            fingers[s] = 1
+            finger_hints.append(hints)
         else:
-            fingers[s] = max(1, min(4, idx))
+            # Same shape seen again — fill in any hint the first occurrence
+            # was missing (a tab author may only finger some instances).
+            existing = finger_hints[tindex[key]]
+            for i in range(6):
+                if existing[i] is None and hints[i] is not None:
+                    existing[i] = hints[i]
+        chords.append((grp[0].time, tindex[key], grp))
+    return singles, chords, templates, finger_hints
+
+
+def chord_fingers(frets, hints=None, log=None):
+    """Fingering for chord templates.
+
+    `hints`, if given, is a 6-tuple of explicit fingers the GP tab author set
+    per string (-1/None where unset) — those are used directly. Any string
+    without a hint falls back to the heuristic:
+
+    A real barre (finger 1 on several strings at the base fret) is only used
+    when there are NO open strings — otherwise DLC Builder flags "barre over
+    open strings". When open strings are present, every fretted note gets a
+    DISTINCT finger (so finger 1 never spans an open string)."""
+    fingers = [-1] * 6
+    pos = [(s, f) for s, f in enumerate(frets) if f > 0]
+    if not pos:
+        return fingers
+    has_open = any(f == 0 for f in frets)
+    base = min(f for _s, f in pos)
+    same_base = sum(1 for _s, f in pos if f == base)
+
+    if same_base > 1 and not has_open:
+        # genuine barre across the base fret
+        for s, f in pos:
+            fingers[s] = 1 if f == base else max(1, min(4, f - base + 1))
+    else:
+        # distinct fingers, low fret -> high; bump on collision so no finger repeats
+        used = set()
+        for s, f in sorted(pos, key=lambda sf: (sf[1], sf[0])):
+            fng = max(1, min(4, f - base + 1))
+            while fng in used and fng < 4:
+                fng += 1
+            used.add(fng)
+            fingers[s] = fng
+
+    # Overlay any explicit fingering the GP tab author actually set — only on
+    # strings that are really fretted here, never guessed at.
+    if hints:
+        for s, f in pos:
+            h = hints[s] if s < len(hints) else None
+            if h is not None and h >= 0:
+                fingers[s] = h
+                if h == 0 and log:
+                    log("  [chord] Using GP-authored thumb fingering on a chord "
+                        "— RS Studio's best guess is finger value 0 for thumb; "
+                        "double-check it shows correctly in-game/DLC Builder.")
     return fingers
 
 
 def build_anchors(items, last_time):
-    """items: list of (time, min_fret, max_fret). Greedy 4-fret window anchors."""
-    anchors, cur = [], None
+    """items: list of (time, min_fret, max_fret).
+
+    Returns [[time, fret, width], ...] fret-hand positions. Instead of starting
+    a fresh anchor at every note that leaves the window (which produces jittery,
+    constantly-moving hands), this segments the note stream: it extends a single
+    anchor forward over as many consecutive notes as fit inside a 4-fret span,
+    then anchors that whole run on its lowest fret (where the index finger sits).
+    Open-string-only events never force a hand move. The result is far closer to
+    how a player actually anchors, which is what CF 'proper FHP' expects."""
+    # Normalise; mark open-only events (no fretted note) with lo=None.
+    evs = []
     for t, lo, hi in items:
-        if lo <= 0:
-            lo = hi if hi > 0 else 1
-        lo = max(1, lo)
-        width = max(4, (hi - lo + 1) if hi > 0 else 4)
-        if cur is None or not (cur[1] <= lo and (hi <= cur[1] + cur[2] - 1 or hi <= 0)):
-            cur = [t, lo, width]
-            anchors.append(cur)
-        elif width > cur[2]:
-            cur[2] = width
+        if hi is None or hi <= 0:
+            evs.append((t, None, None))
+        else:
+            lo = max(1, lo if (lo and lo > 0) else hi)
+            evs.append((t, lo, max(hi, lo)))
+
+    anchors = []
+    i, n = 0, len(evs)
+    while i < n:
+        # leading open-only events ride the previous anchor (or a default first)
+        if evs[i][1] is None:
+            if not anchors:
+                anchors.append([evs[i][0], 1, 4])
+            i += 1
+            continue
+        start_t, seg_lo, seg_hi = evs[i][0], evs[i][1], evs[i][2]
+        j = i + 1
+        while j < n:
+            lo2, hi2 = evs[j][1], evs[j][2]
+            if lo2 is None:          # open notes don't break a hand position
+                j += 1
+                continue
+            nlo, nhi = min(seg_lo, lo2), max(seg_hi, hi2)
+            if nhi - nlo + 1 <= 4:   # still fits one 4-fret hand span
+                seg_lo, seg_hi = nlo, nhi
+                j += 1
+            else:
+                break
+        width = max(4, seg_hi - seg_lo + 1)
+        anchors.append([start_t, seg_lo, width])
+        i = j
+    if not anchors:
+        anchors.append([0.0, 1, 4])
     return anchors
 
 
@@ -425,12 +649,13 @@ def xml_escape(s):
             .replace('"', "&quot;"))
 
 
-def note_attrs(n, in_chord=False):
+def note_attrs(n, in_chord=False, mute_override=None):
+    _mute = int(n.mute) if mute_override is None else int(mute_override)
     a = {
         "time": f3(n.time), "linkNext": int(n.link_next), "accent": int(n.accent),
         "bend": (f"{n.max_bend:g}" if n.max_bend else "0"), "fret": n.fret,
         "hammerOn": int(n.hammer), "harmonic": int(n.harmonic), "hopo": int(n.hammer or n.pull),
-        "ignore": 0, "leftHand": -1, "mute": int(n.mute), "palmMute": int(n.palm),
+        "ignore": 0, "leftHand": -1, "mute": _mute, "palmMute": int(n.palm),
         "pluck": -1, "pullOff": int(n.pull), "slap": -1,
         "slideTo": n.slide_to, "string": n.string, "sustain": f3(n.sustain),
         "tremolo": int(n.tremolo), "harmonicPinch": int(n.pinch), "pickDirection": 0,
@@ -473,26 +698,41 @@ def render_chords(chords, indent="        "):
     for t, cid, grp in chords:
         palm = int(all(n.palm for n in grp))
         accent = int(any(n.accent for n in grp))
-        mute = int(all(n.mute for n in grp))
+        chord_muted = all(n.mute for n in grp)
+        mute = int(chord_muted)
         link = int(any(n.link_next for n in grp))
         head = (f'{indent}<chord time="{f3(t)}" linkNext="{link}" accent="{accent}" chordId="{cid}" '
                 f'fretHandMute="{mute}" highDensity="0" ignore="0" palmMute="{palm}" hopo="0" strum="down">')
         body = ""
+        # A single string must not be muted inside a non-muted chord
+        # (DLC Builder: "muted string in non-muted chord").
+        _mo = None if chord_muted else 0
         for n in grp:
             bv = bend_values_xml(n, indent + "    ")
             if bv:
-                body += f"{indent}  <chordNote {note_attrs(n, True)}>\n{bv}{indent}  </chordNote>\n"
+                body += f"{indent}  <chordNote {note_attrs(n, True, _mo)}>\n{bv}{indent}  </chordNote>\n"
             else:
-                body += f"{indent}  <chordNote {note_attrs(n, True)}/>\n"
+                body += f"{indent}  <chordNote {note_attrs(n, True, _mo)}/>\n"
         out.append(head + "\n" + body + f"{indent}</chord>")
     return "\n".join(out)
+
+
+def apply_low_bass_fix(offs, is_bass, pitch):
+    """Rocksmith low-bass-tuning workaround (matches DLC Builder's ApplyLowTuningFix):
+    a bass tuned very low (TuningPitch > 230 and any string offset < -4) is raised
+    an octave (+12 per string) with TuningPitch dropped to 220 Hz. Same sounding
+    pitch, but the game detects it. Returns (offs, pitch)."""
+    if is_bass and pitch > 230.0 and any(o < -4 for o in offs):
+        offs = [o + 12 for o in offs]
+        pitch = 220.0
+    return offs, pitch
 
 
 def make_arrangement(gp, ti, args):
     leadin = args.leadin
     bpm_scale = getattr(args, "bpm_scale", 1.0)
     notes, beats, bar_times = convert_track(gp, ti, leadin, bpm_scale=bpm_scale)
-    singles, chords, templates = group_chords(notes)
+    singles, chords, templates, finger_hints = group_chords(notes)
     body_end = bar_times[-1][0] + bar_times[-1][1] * 60.0 / bar_times[-1][2]
     # Use audio duration if available so SongLength always spans the full audio file.
     # Without this, GP files with fewer bars than the audio length cause notes to
@@ -502,6 +742,12 @@ def make_arrangement(gp, ti, args):
         song_len = audio_dur + 1.0   # tiny buffer so Rocksmith doesn't clip the tail
     else:
         song_len = body_end + 3.0
+    # Make sure SongLength always covers the last note (+ its sustain) so DLC
+    # Builder never flags "note after song end".
+    _alln = list(singles) + [n for (_t, _c, grp) in chords for n in grp]
+    last_note_end = max((n.time + (getattr(n, "sustain", 0.0) or 0.0) for n in _alln),
+                        default=body_end)
+    song_len = max(song_len, last_note_end + 0.5)
 
     # ebeats
     ebeats = []
@@ -515,6 +761,11 @@ def make_arrangement(gp, ti, args):
     # last ebeat.  body_end is one beat past the last ebeat (end of last bar),
     # so clamp everything to last_ebeat_t — exactly what CST does in its own
     # LoadFromFolder path.
+    # Terminal ebeat at the end of the last bar so the trailing no-guitar section
+    # / END phrase sit AFTER the final note (otherwise notes in the last beat fall
+    # "inside" the no-guitar section).
+    if not ebeats or ebeats[-1][0] < body_end - 1e-6:
+        ebeats.append((body_end, -1))
     last_ebeat_t = ebeats[-1][0] if ebeats else body_end
 
     # sections & phrases
@@ -569,11 +820,20 @@ def make_arrangement(gp, ti, args):
     stream.sort()
     anchors = build_anchors(stream, body_end)
 
-    # handshapes: one per chord, end at min(next event, chord end)
+    # handshapes: one per chord. End at the chord's sustain, but never let a
+    # handshape span an anchor change (DLC Builder flags "anchor inside
+    # handshape"), so cap it at the next anchor after the chord.
+    import bisect as _bis
+    _anchor_ts = sorted(a[0] for a in anchors)
     handshapes = []
     for idx, (t, cid, grp) in enumerate(chords):
-        end = t + max(n.sustain or n.dur * 0.8 for n in grp)
-        handshapes.append((cid, t, min(end, song_len)))
+        end = min(t + max(n.sustain or n.dur * 0.8 for n in grp), song_len)
+        _i = _bis.bisect_right(_anchor_ts, t + 1e-4)
+        if _i < len(_anchor_ts):
+            end = min(end, _anchor_ts[_i])
+        if end <= t:
+            end = t + 0.05
+        handshapes.append((cid, t, end))
 
     tun, _ = gp.effective_tuning(ti)
     is_bass = args.arr == "Bass"
@@ -581,9 +841,39 @@ def make_arrangement(gp, ti, args):
     offs = [tun[i] - ref[i] for i in range(min(len(ref), len(tun)))]
     while len(offs) < 6:
         offs.append(0)
+    offs, _lbp = apply_low_bass_fix(offs, is_bass, 440.0)
     avg_bpm = sum(b for _, _, b in bar_times) / len(bar_times)
 
     used = lambda f: int(any(f(n) for n in notes))
+
+    # ── accurate chord/technique flags for <arrangementProperties> ──────────
+    # CF "official looking" checks these match the actual chart content.
+    def _pitch(nn):
+        return tun[nn.string] + nn.fret if 0 <= nn.string < len(tun) else nn.fret
+    has_barre = 0
+    for _frets in templates:
+        _ft = sorted({f for f in _frets if f > 0})
+        if _ft and sum(1 for f in _frets if f == _ft[0]) >= 2:
+            has_barre = 1
+            break
+    has_power = has_double = has_openchord = 0
+    for _t, _cid, _grp in chords:
+        _frets_only = [n.fret for n in _grp]
+        if any(f == 0 for f in _frets_only) and any(f > 0 for f in _frets_only):
+            has_openchord = 1
+        _ps = sorted(_pitch(n) for n in _grp)
+        if len(_grp) == 2:
+            _iv = _ps[1] - _ps[0]
+            if _iv in (7, 12):           # root + 5th / octave -> power chord
+                has_power = 1
+            else:
+                has_double = 1
+        elif len(_grp) == 3:
+            _ivset = {_ps[1] - _ps[0], _ps[2] - _ps[1]}
+            if _ivset <= {5, 7} or _ivset == {7, 5}:   # root-5th-octave shape
+                has_power = 1
+    has_fhmute = used(lambda n: getattr(n, "mute", False))
+
     title = args.title or gp.title or "Unknown"
     artist = args.artist or gp.artist or "Unknown"
 
@@ -606,18 +896,20 @@ def make_arrangement(gp, ti, args):
     A(f"  <albumYear>{args.year}</albumYear>")
     A("  <crowdSpeed>1</crowdSpeed>")
     A('  <arrangementProperties represent="1" bonusArr="0" standardTuning="%d" '
-      'nonStandardChords="0" barreChords="0" powerChords="0" dropDPower="0" '
-      'openChords="1" fingerPicking="0" pickDirection="0" doubleStops="0" '
+      'nonStandardChords="0" barreChords="%d" powerChords="%d" dropDPower="0" '
+      'openChords="%d" fingerPicking="0" pickDirection="0" doubleStops="%d" '
       'palmMutes="%d" harmonics="%d" pinchHarmonics="%d" hopo="%d" tremolo="%d" '
       'slides="%d" unpitchedSlides="%d" bends="%d" tapping="0" vibrato="%d" '
-      'fretHandMutes="0" slapPop="0" twoFingerPicking="0" fifthsAndOctaves="0" '
+      'fretHandMutes="%d" slapPop="0" twoFingerPicking="0" fifthsAndOctaves="0" '
       'syncopation="0" bassPick="0" sustain="1" pathLead="%d" pathRhythm="%d" '
       'pathBass="%d" routeMask="%d"/>' % (
           int(all(o == 0 for o in offs)),
+          has_barre, has_power, has_openchord, has_double,
           used(lambda n: n.palm), used(lambda n: n.harmonic), used(lambda n: n.pinch),
           used(lambda n: n.hammer or n.pull), used(lambda n: n.tremolo),
           used(lambda n: n.slide_to > 0), used(lambda n: n.uslide_to > 0),
           used(lambda n: n.max_bend > 0), used(lambda n: n.vibrato),
+          has_fhmute,
           int(args.arr == "Lead"), int(args.arr == "Rhythm"),
           int(args.arr == "Bass"),
           {"Lead": 1, "Rhythm": 2, "Bass": 4}.get(args.arr, 1)))
@@ -643,8 +935,8 @@ def make_arrangement(gp, ti, args):
     A('  <linkedDiffs count="0"/>')
     A('  <phraseProperties count="0"/>')
     A(f'  <chordTemplates count="{len(templates)}">')
-    for frets in templates:
-        fingers = chord_fingers(list(frets))
+    for _ci, frets in enumerate(templates):
+        fingers = chord_fingers(list(frets), hints=finger_hints[_ci])
         attrs = " ".join(f'fret{i}="{frets[i]}" finger{i}="{fingers[i]}"' for i in range(6))
         A(f'    <chordTemplate chordName="" displayName="" {attrs}/>')
     A("  </chordTemplates>")
@@ -657,7 +949,20 @@ def make_arrangement(gp, ti, args):
     for name, num, t in sections:
         A(f'    <section name="{name}" number="{num}" startTime="{f3(t)}"/>')
     A("  </sections>")
-    A('  <events count="0"/>')
+    # Tone-change events: each is (time_seconds, slot 0-3) where slot maps to
+    # the arrangement's Tones[A..D] list in the .rs2dlc project (built by
+    # build_project()). The tone active at song start is the project's
+    # BaseTone and needs no event here — Rocksmith just starts on it.
+    tone_events = sorted(getattr(args, "tone_events", None) or [])
+    _TONE_CODES = ("tone_a", "tone_b", "tone_c", "tone_d")
+    if tone_events:
+        A(f'  <events count="{len(tone_events)}">')
+        for t, slot in tone_events:
+            code = _TONE_CODES[max(0, min(3, int(slot)))]
+            A(f'    <event time="{f3(t)}" code="{code}"/>')
+        A("  </events>")
+    else:
+        A('  <events count="0"/>')
 
     def level_block(tag, diff):
         B = []
@@ -850,7 +1155,121 @@ def lrc_to_vocals(path, leadin=0.0, lrc_offset=0.0, warp_anchors=None):
     return "\n".join(out)
 
 
-def main():
+def gp_embedded_lyrics(gp):
+    """Find lyrics embedded in the .gp itself (Official UG / many GP files carry
+    them). Returns (track_index, [(offset_bar, text), ...]) for the first track
+    that has a <Lyrics> block, else (None, []).
+
+    Defensive about tag names across GP versions: looks for <Lyrics>/<Line> with
+    <Text> and a bar offset in <Offset>/<Bar> or an attribute."""
+    def _line_offset(line):
+        for tag in ("Offset", "Bar", "StartBar", "bar", "offset"):
+            v = line.findtext(tag) if tag[0].isupper() else line.get(tag)
+            if v not in (None, ""):
+                try:
+                    return int(float(v))
+                except Exception:
+                    pass
+        for a in ("offset", "bar", "startBar"):
+            if line.get(a):
+                try:
+                    return int(float(line.get(a)))
+                except Exception:
+                    pass
+        return 0
+
+    for ti, tr in enumerate(gp.tracks):
+        lyr = tr.find("Lyrics")
+        if lyr is None:
+            # some files nest it deeper
+            lyr = next((e for e in tr.iter() if e.tag == "Lyrics"), None)
+        if lyr is None:
+            continue
+        lines = []
+        for line in lyr.iter("Line"):
+            text = (line.findtext("Text") or "").strip()
+            if text:
+                lines.append((_line_offset(line), text))
+        if lines:
+            return ti, lines
+    return None, []
+
+
+def _syllabify(text):
+    """Split a GP lyric line into (syllable, is_word_final) tokens.
+    GP marks syllable breaks within a word with '-', words with spaces, and the
+    occasional '+' elision (treated here as a word break)."""
+    out = []
+    for word in text.replace("+", " ").split():
+        sylls = [s for s in word.split("-") if s != ""]
+        for k, s in enumerate(sylls):
+            out.append((s, k == len(sylls) - 1))
+    return out
+
+
+def gp_lyric_lines(gp, leadin, bpm_scale=1.0):
+    """[(start_time, line_text), ...] for the embedded lyrics — used by the Sync
+    preview's karaoke strip. Each line is timed to the first note at/after its
+    offset bar."""
+    import bisect
+    ti, lines = gp_embedded_lyrics(gp)
+    if ti is None:
+        return []
+    beats, bar_times = gp.track_beats(ti, leadin, bpm_scale=bpm_scale)
+    starts = [b.start for b in beats]
+    out = []
+    for off, text in lines:
+        bt = bar_times[off][0] if 0 <= off < len(bar_times) else (
+            bar_times[0][0] if bar_times else leadin)
+        i = bisect.bisect_left(starts, bt - 1e-6)
+        t = starts[i] if i < len(starts) else bt
+        plain = re.sub(r"\s+", " ", text.replace("-", "").replace("+", " ")).strip()
+        out.append((t, plain))
+    out.sort()
+    return out
+
+
+def gp_lyrics_to_vocals(gp, leadin, bpm_scale=1.0):
+    """Build a Rocksmith vocals XML straight from the lyrics embedded in the .gp,
+    timing each syllable to the lyric track's note onsets. Returns the XML, or
+    None if the file has no embedded lyrics."""
+    import bisect
+    ti, lines = gp_embedded_lyrics(gp)
+    if ti is None:
+        return None
+    beats, bar_times = gp.track_beats(ti, leadin, bpm_scale=bpm_scale)
+    if not beats:
+        return None
+    starts = [b.start for b in beats]
+    n = len(beats)
+    vocals = []
+    for off, text in lines:
+        toks = _syllabify(text)
+        if not toks:
+            continue
+        bt = bar_times[off][0] if 0 <= off < len(bar_times) else bar_times[0][0]
+        start_idx = bisect.bisect_left(starts, bt - 1e-6)
+        for k, (syl, final) in enumerate(toks):
+            bi = start_idx + k
+            if bi >= n:
+                break
+            t = beats[bi].start
+            nxt = beats[bi + 1].start if bi + 1 < n else t + (beats[bi].dur or 0.4)
+            length = max(0.15, min(nxt - t, 2.0))
+            syl = re.sub(r'[<>&"]', "", syl)[:32]
+            mark = syl + ("" if final else "-")   # '-' = hyphenated continuation
+            vocals.append((t, length, mark))
+    if not vocals:
+        return None
+    vocals.sort()
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', f'<vocals count="{len(vocals)}">']
+    for t, ln, w in vocals:
+        out.append(f'  <vocal time="{f3(t)}" note="254" length="{f3(ln)}" lyric="{xml_escape(w)}"/>')
+    out.append("</vocals>")
+    return "\n".join(out)
+
+
+def main(args=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("gpfile", nargs="?")
     ap.add_argument("--list", action="store_true")
@@ -868,7 +1287,8 @@ def main():
     ap.add_argument("--lyrics-txt", default=None,
                     help="plain lyrics with [Section] headers -> vocals XML timed via GP sections")
     ap.add_argument("-o", "--out", default=None)
-    args = ap.parse_args()
+    if args is None:
+        args = ap.parse_args()
 
     if args.lrc and not args.gpfile:
         out = args.out or "vocals.xml"
@@ -890,11 +1310,10 @@ def main():
     if args.all:
         guitars = [i for i in range(len(gp.tracks)) if gp.track_kind(i) == "guitar"]
         basses = [i for i in range(len(gp.tracks)) if gp.track_kind(i) == "bass"]
-        # more chords per note-event -> Rhythm; the other guitar -> Lead
         if len(guitars) >= 2:
             def chordiness(i):
                 notes, _, _ = convert_track(gp, i, args.leadin)
-                _, ch, _ = group_chords(notes)
+                _, ch, _, _ = group_chords(notes)
                 return len(ch) / max(1, len(notes))
             ranked = sorted(guitars, key=chordiness)
             jobs.append((ranked[0], "Lead", f"{base}_lead.xml"))
@@ -950,6 +1369,7 @@ def _auto_invocation():
     p.add_argument("gp", nargs="?", default=path)
     p.add_argument("--all", action="store_true", default=True)
     args = p.parse_args([path, "--all"])
+    args.gpfile = path
     main(args)
 
 

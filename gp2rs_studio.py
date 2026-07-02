@@ -27,33 +27,53 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gp2rs  # noqa: E402
 import subprocess  # noqa: E402
 try:
-    import cst_template
-except Exception:
-    cst_template = None
-try:
     import wwise_convert
 except Exception:
     wwise_convert = None
+try:
+    import tone_designer
+except Exception:
+    tone_designer = None
+try:
+    import pdf2gp  # PDF tab -> .gp5 import (needs opencv/pikepdf/pdfplumber; see _ensure_pdf2gp_deps)
+    PDF2GP_IMPORT_ERROR = None
+except Exception as _pdf2gp_e:
+    import traceback as _pdf2gp_tb
+    pdf2gp = None
+    # Keep the real reason (e.g. a missing DLL inside a frozen build) instead
+    # of silently swallowing it — surfaced later by _ensure_pdf2gp_deps so a
+    # bundled-but-broken import doesn't look identical to "not bundled at all".
+    PDF2GP_IMPORT_ERROR = "".join(_pdf2gp_tb.format_exception(
+        type(_pdf2gp_e), _pdf2gp_e, _pdf2gp_e.__traceback__))
 
 try:
     from PIL import Image, ImageTk
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
-    # Attempt silent background install of Pillow so art features work
-    def _try_install_pillow():
-        try:
-            import subprocess as _sp, sys as _sys
-            _sp.run([_sys.executable, "-m", "pip", "install", "Pillow", "--quiet",
-                     "--break-system-packages"],
-                    capture_output=True, timeout=60)
-            # Reload attempt — if it works HAS_PIL will be True next launch
-        except Exception:
-            pass
-    import threading as _th
-    _th.Thread(target=_try_install_pillow, daemon=True).start()
+    # Attempt silent background install of Pillow so art features work.
+    # CRITICAL: never do this in a frozen build — there sys.executable is
+    # RS STUDIO.exe itself, so "sys.executable -m pip ..." RELAUNCHES the app,
+    # and every relaunch does it again (infinite windows). Only run from source.
+    import sys as _sys
+    if not getattr(_sys, "frozen", False):
+        def _try_install_pillow():
+            try:
+                import subprocess as _sp
+                _sp.run([_sys.executable, "-m", "pip", "install", "Pillow", "--quiet"],
+                        capture_output=True, timeout=60)
+            except Exception:
+                pass
+        import threading as _th
+        _th.Thread(target=_try_install_pillow, daemon=True).start()
 
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+class _SkipBlock(Exception):
+    """Lightweight control-flow sentinel for bailing out of a try block early
+    (e.g. skipping lyrics auto-fetch when lyrics already exist) without
+    disturbing that block's own exception handling for real errors."""
+    pass
 
 def _config_path():
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
@@ -142,7 +162,27 @@ TONE_PRESETS = json.loads(r'''{"Clean - Twin": {"GearList": {"Amp": {"Type": "Am
 PRESET_LABELS = list(TONE_PRESETS)
 GUITAR_PRESETS = [p for p in PRESET_LABELS if not p.startswith("Bass")]
 BASS_PRESETS = [p for p in PRESET_LABELS if p.startswith("Bass")]
-ARR_ENUM = {"Lead": (0, 1), "Rhythm": (2, 2), "Bass": (3, 4)}
+# (ArrangementName enum, RouteMask). "Bonus Rhythm"/"Bonus Lead" are second
+# guitar paths (same name/route as Rhythm/Lead) flagged as bonus in the manifest.
+ARR_ENUM = {"Lead": (0, 1), "Rhythm": (2, 2), "Bass": (3, 4),
+            "Bonus Rhythm": (2, 2), "Bonus Lead": (0, 1)}
+# Which arrangements are guitar-type vs bass-type (used by auto-fill + build).
+ARR_KIND = {"Lead": "guitar", "Rhythm": "guitar", "Bonus Rhythm": "guitar",
+            "Bonus Lead": "guitar", "Bass": "bass"}
+# What a bonus arrangement reports as (valid RS name) when built.
+ARR_BONUS_BASE = {"Bonus Rhythm": "Rhythm", "Bonus Lead": "Lead"}
+
+def _arr_slug(arr):
+    """Filename/tone-key-safe token for an arrangement label."""
+    return arr.lower().replace(" ", "_")
+
+def _guess_bonus_kind(track_name):
+    """An extra guitar beyond Lead+Rhythm: pick Bonus Lead for lead-ish tracks
+    (lead/solo/melody/harmony) else Bonus Rhythm. User can still override."""
+    n = (track_name or "").lower()
+    if any(k in n for k in ("lead", "solo", "melody", "harmony", "lick")):
+        return "Bonus Lead"
+    return "Bonus Rhythm"
 
 def auto_preset(name):
     n = name.lower()
@@ -584,60 +624,11 @@ def _find_slopsmith_exe():
                 return p
     return _find_exe("Slopsmith") or _find_exe("slopsmith-desktop")
 
-def preset_to_tone2014(preset_dict, tone_key):
-    """Convert a TONE_PRESETS entry into the lightweight dict CST expects."""
-    return {
-        "Key": tone_key,
-        "Name": tone_key,
-        "Volume": preset_dict.get("Volume", "-18.0"),
-        "GearList": preset_dict.get("GearList", {}),
-        "ToneDescriptors": preset_dict.get("ToneDescriptors", []),
-        "IsCustom": True,
-    }
-
 # ────────────────────────────────────────────────────────────────────────────
 
 def make_dlc_key(artist, title):
     key = re.sub(r"[^A-Za-z0-9]", "", (artist + title))[:30]
     return key if (key and key[0].isalpha()) else "Song" + key
-
-def _find_packer(extra_hint=None):
-    """Search common locations for packer.exe, return path or None."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    search_bases = [
-        extra_hint or "",
-        os.environ.get("CST_PATH", ""),
-        here,  # same folder as the script
-        os.path.join(here, "CST"),
-        os.path.join(here, "toolkit"),
-        r"C:\Program Files (x86)\Custom Song Toolkit",
-        r"C:\Program Files\Custom Song Toolkit",
-        r"C:\CST",
-        r"C:\CustomSongToolkit",
-        os.path.join(os.path.expanduser("~"), "CST"),
-        os.path.join(os.path.expanduser("~"), "Custom Song Toolkit"),
-        os.path.expanduser("~"),
-    ]
-    seen = set()
-    for base in filter(None, search_bases):
-        base = os.path.normpath(base)
-        if base in seen or not os.path.exists(base): continue
-        seen.add(base)
-        # Direct file check first (fast)
-        direct = os.path.join(base, "packer.exe")
-        if os.path.isfile(direct): return direct
-        # Walk up to 3 levels deep (avoid full home-dir crawl)
-        try:
-            for root_dir, dirs, files in os.walk(base):
-                depth = root_dir[len(base):].count(os.sep)
-                if depth > 3:
-                    dirs[:] = []
-                    continue
-                if "packer.exe" in files:
-                    return os.path.join(root_dir, "packer.exe")
-        except Exception:
-            continue
-    return None
 
 def _app_dir():
     """Directory that contains the running exe (or script in dev mode)."""
@@ -748,6 +739,47 @@ def _probe_sample_rate(ffmpeg, path):
         return int(m.group(1)) if m else None
     except Exception: return None
 
+# Lossy formats where a quoted "kb/s" actually reflects encoded quality. WAV/
+# FLAC/AIFF are lossless containers — their raw PCM bitrate is meaningless as
+# a quality signal, so they're never bitrate-checked.
+_LOSSY_AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wma", ".webm"}
+MIN_AUDIO_BITRATE_KBPS = 120  # CDLC community standard floor for source audio
+
+def _probe_bitrate_kbps(ffmpeg, path):
+    """Read the encoded bitrate ffmpeg reports for the (first) audio stream."""
+    try:
+        r = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True,
+                           timeout=60, creationflags=CREATE_NO_WINDOW)
+        # Prefer the per-stream rate ("Stream #0:0: Audio: ..., 128 kb/s") over
+        # the overall container bitrate, which can include video/other streams.
+        m = re.search(r"Stream #\d+:\d+.*?Audio:.*?(\d+)\s*kb/s", (r.stderr or ""))
+        if not m:
+            m = re.search(r"bitrate:\s*(\d+)\s*kb/s", (r.stderr or ""))
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+def check_audio_quality(audio_path, log=print):
+    """Warn (don't block) when a lossy source is below the CDLC community's
+    120kbps floor — per the guide, low source quality is audible after the
+    OGG/WEM re-encode even though RS Studio's own pipeline can't fix it."""
+    try:
+        ext = os.path.splitext(audio_path)[1].lower()
+        if ext not in _LOSSY_AUDIO_EXTS:
+            return None
+        ff = _find_exe("ffmpeg")
+        if not ff:
+            return None
+        kbps = _probe_bitrate_kbps(ff, audio_path)
+        if kbps is not None and kbps < MIN_AUDIO_BITRATE_KBPS:
+            log(f"  [audio] ⚠ Source audio is ~{kbps}kbps — below the "
+                f"{MIN_AUDIO_BITRATE_KBPS}kbps CDLC quality floor. It'll still "
+                f"build, but expect audible compression artifacts after the "
+                f"OGG/WEM re-encode. Try a higher-quality source if you can.")
+        return kbps
+    except Exception:
+        return None
+
 def generate_preview_audio(ffmpeg, input_wav, dest_dir, log):
     out_prev = os.path.join(dest_dir, os.path.splitext(os.path.basename(input_wav))[0] + "_preview.wav")
     if os.path.exists(out_prev): return out_prev
@@ -764,23 +796,179 @@ def generate_preview_audio(ffmpeg, input_wav, dest_dir, log):
     except Exception: pass
     return None
 
-def ensure_wav(audio_path, dest_dir, log, leadin=0.0):
+# CustomsForge charting standard: 10s of lead-in silence + ~2s tail silence.
+LEAD_SILENCE = 10.0   # fixed audio silence before the song (also covers count-in)
+TAIL_SILENCE = 2.0    # silence padded onto the end of the track
+
+
+def ensure_wav(audio_path, dest_dir, log, leadin=0.0, tail=0.0):
     ff = _find_exe("ffmpeg")
     ext = os.path.splitext(audio_path)[1].lower()
     rate = _probe_sample_rate(ff, audio_path) if ff else None
-    if ext == ".wav" and rate == 48000 and leadin <= 0: return audio_path
+    if ext == ".wav" and rate == 48000 and leadin <= 0 and tail <= 0: return audio_path
     if not ff: raise ValueError("Requires ffmpeg.exe for audio normalization.")
     out = os.path.join(dest_dir, os.path.splitext(os.path.basename(audio_path))[0] + "_48k.wav")
     delay_ms = int(round(max(0.0, leadin) * 1000))
-    # Strip encoder-padding/silence before music starts, then add our leadin.
-    # -60dB threshold is conservative and won't cut quiet intros.
-    ss = "silenceremove=start_periods=1:start_threshold=-60dB:start_duration=0.05,"
-    af = f"{ss}adelay={delay_ms}|{delay_ms},aresample=resampler=soxr" if delay_ms > 0 else f"{ss}aresample=resampler=soxr"
+    # Strip encoder-padding/silence before music starts, then add our lead-in and
+    # tail silence. -60dB threshold is conservative and won't cut quiet intros.
+    chain = ["silenceremove=start_periods=1:start_threshold=-60dB:start_duration=0.05"]
+    if delay_ms > 0:
+        chain.append(f"adelay={delay_ms}|{delay_ms}")
+    if tail and tail > 0:
+        chain.append(f"apad=pad_dur={tail}")
+    chain.append("aresample=resampler=soxr")
+    af = ",".join(chain)
     r = subprocess.run([ff, "-y", "-i", audio_path, "-ar", "48000", "-ac", "2", "-sample_fmt", "s16", "-af", af, out], capture_output=True, text=True, timeout=300, creationflags=CREATE_NO_WINDOW)
     if r.returncode != 0 or not os.path.exists(out):
-        af2 = f"adelay={delay_ms}|{delay_ms}" if delay_ms > 0 else "anull"
+        chain2 = []
+        if delay_ms > 0:
+            chain2.append(f"adelay={delay_ms}|{delay_ms}")
+        if tail and tail > 0:
+            chain2.append(f"apad=pad_dur={tail}")
+        af2 = ",".join(chain2) if chain2 else "anull"
         subprocess.run([ff, "-y", "-i", audio_path, "-ar", "48000", "-ac", "2", "-sample_fmt", "s16", "-af", af2, out], capture_output=True, creationflags=CREATE_NO_WINDOW)
     return out
+
+def _auto_volume(audio_path, log=print):
+    """Match DLC Builder's auto-volume: BS.1770 integrated loudness with a -16 LUFS
+    reference -> volume = round(-16 - I, 1). Measured via ffmpeg's ebur128 filter."""
+    ff = _find_exe("ffmpeg")
+    if not (ff and audio_path and os.path.isfile(audio_path)):
+        return None
+    try:
+        r = subprocess.run([ff, "-hide_banner", "-nostats", "-i", audio_path,
+                            "-af", "ebur128", "-f", "null", "-"],
+                           capture_output=True, text=True, timeout=300,
+                           creationflags=CREATE_NO_WINDOW)
+        out = (r.stderr or "") + (r.stdout or "")
+        import re as _rev
+        vals = _rev.findall(r"I:\s*(-?\d+(?:\.\d+)?)\s*LUFS", out)  # last = integrated summary
+        if not vals:
+            return None
+        I = float(vals[-1])
+        if I <= -70:                      # silence / unmeasurable
+            return None
+        vol = round(-16.0 - I, 1)
+        log(f"  [volume] auto: integrated={I:.1f} LUFS -> volume={vol} dB")
+        return vol
+    except Exception as e:
+        log(f"  [volume] auto-volume failed: {e}")
+        return None
+
+
+def _pick_clean_audio(json_lines, target_dur=None):
+    """From yt-dlp --dump-json candidate lines, pick the best audio source.
+
+    Two factors: (1) cleanliness — avoid official music videos / live / remixes
+    whose intro SFX & crowd noise wreck transcription and sync; prefer Topic /
+    official-audio / lyric / visualizer uploads. (2) LENGTH MATCH — when
+    `target_dur` (the GP tab's content length in seconds) is given, strongly
+    prefer the candidate whose duration is closest, since Songsterr tabs are
+    timed to a specific master recording and the closest-length upload is
+    usually the right one (no end-stretching needed)."""
+    BAD = ("official video", "official music video", "music video", "m/v", "official mv",
+           "video oficial", "vídeo oficial", "videoclip", "video musical", "musica oficial",
+           "(live", "live at", "live in", "live performance", "performance",
+           "en vivo", "en directo", "reaction", " cover", "remix", "sped up", "slowed",
+           "nightcore", "8d audio", "fan made", "amv", "trailer", "behind the scenes")
+    best, best_sc = None, None
+    for i, ln in enumerate(json_lines):
+        try:
+            d = json.loads(ln)
+        except Exception:
+            continue
+        chan = (str(d.get("uploader", "")) + " " + str(d.get("channel", ""))).lower()
+        hay = (str(d.get("title", "")) + " " + chan).lower()
+        sc = 0.0
+        if "lyric" in hay or "letra" in hay:   # LYRIC VIDEO (incl. Spanish "letra"/"con letra")
+            sc += 10
+        if "visualizer" in hay:
+            sc += 5
+        if "topic" in chan:              # clean album audio (only if no lyric video)
+            sc += 3
+        for g in ("official audio", "audio)", "audio]", " audio", "provided to youtube"):
+            if g in hay:
+                sc += 2
+        for b in BAD:
+            if b in hay:
+                sc -= 5
+        # Length match against the GP tab — the strongest single signal when
+        # available. Closest duration wins; far-off lengths are penalised.
+        if target_dur and target_dur > 0:
+            try:
+                cd = float(d.get("duration") or 0)
+            except Exception:
+                cd = 0.0
+            if cd > 0:
+                diff = abs(cd - target_dur)
+                if diff <= 3:    sc += 9
+                elif diff <= 6:  sc += 6
+                elif diff <= 12: sc += 3
+                elif diff <= 25: sc += 0
+                else:            sc -= min(8.0, diff / 15.0)
+        sc -= i * 0.1                     # tie-break toward higher-ranked hits
+        if best_sc is None or sc > best_sc:
+            best_sc, best = sc, d
+    if best is None:
+        for ln in json_lines:
+            try:
+                return json.loads(ln)
+            except Exception:
+                continue
+        raise Exception("No parseable video data.")
+    return best
+
+
+def itunes_metadata(artist, title, timeout=10):
+    """Authoritative song metadata from the keyless iTunes Search API.
+
+    Returns {title, artist, album, year, art_url} for the best scored match,
+    or {} on a miss. Mirrors the proven flow: YouTube for audio, iTunes for the
+    real title/artist/album/year (which then feeds a clean lyrics lookup)."""
+    import urllib.request as _ur, urllib.parse as _up, json as _j, re as _re
+    def _norm(s): return _re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+    def _clean(s): return _re.sub(r"^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$", "", s or "").strip()
+    st, sa = _clean(title), _clean(artist)
+    if not st and not sa:
+        return {}
+    tl, al = _norm(title), _norm(artist)
+    term = _up.quote(f"{sa} {st}".strip())
+    url = f"https://itunes.apple.com/search?term={term}&entity=song&limit=15"
+    try:
+        req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _ur.urlopen(req, timeout=timeout) as r:
+            data = _j.loads(r.read().decode("utf-8"))
+    except Exception:
+        return {}
+    best = None
+    for res in data.get("results", []):
+        tn, an = _norm(res.get("trackName", "")), _norm(res.get("artistName", ""))
+        score = (2 if tl and tl in tn else 0) + (1 if al and al in an else 0)
+        if score == 0 and st and st.lower() in res.get("trackName", "").lower():
+            score = 1
+        if score > 0 and (best is None or score > best[0]):
+            best = (score, res)
+    if not best:
+        return {}
+    score, res = best
+    album = _re.sub(
+        r"\s*[\-\(]\s*(Single|EP|Live|Acoustic|Deluxe(\s+Edition)?|"
+        r"Remastered?(\s+Edition)?|\d{4}\s+Remaster)[\)\s]*$",
+        "", res.get("collectionName", ""), flags=_re.IGNORECASE).strip()
+    art = (res.get("artworkUrl100", "")
+           .replace("100x100bb", "600x600bb").replace("100x100", "600x600"))
+    return {
+        "title":   res.get("trackName", "").strip(),
+        "artist":  res.get("artistName", "").strip(),
+        "album":   album,
+        "year":    str(res.get("releaseDate", ""))[:4],
+        "art_url": art,
+        # 2 = both title+artist substring-matched the query, 1 = title only.
+        # The caller uses this so it doesn't second-guess an already-confident
+        # iTunes match using a noisy YouTube-parsed seed string.
+        "match_score": score,
+    }
+
 
 def fetch_media_pack(artist, title, dest_dir, confirmed_url, log):
     results = {"audio": None, "preview": None, "art": None, "lyrics": None, "album": "", "year": ""}
@@ -916,243 +1104,115 @@ def fetch_media_pack(artist, title, dest_dir, confirmed_url, log):
         except Exception as e: log(f"  Audio fetch failed: {e}")
     return results
 
-def _find_ddc_support(ddc_path, packer_path, app_dir):
-    """Locate DDC's ramp-up model (.xml) and config (.cfg). These ship in the
-    toolkit's 'ddc' folder; DDC fails silently without them. Returns
-    (ramp_xml, cfg) absolute paths, or (None, None) if not found."""
-    import glob as _glob
-    cand_dirs = []
-    if ddc_path:
-        cand_dirs += [os.path.dirname(ddc_path),
-                      os.path.join(os.path.dirname(ddc_path), "ddc")]
-    if packer_path:
-        _tk = os.path.dirname(packer_path)
-        cand_dirs += [os.path.join(_tk, "ddc"), _tk]
-    if app_dir:
-        cand_dirs += [os.path.join(app_dir, "ddc"),
-                      os.path.join(app_dir, "tools", "ddc"),
-                      os.path.join(app_dir, "tools"), app_dir]
-    seen = set()
-    for d in cand_dirs:
-        if not d or d in seen or not os.path.isdir(d):
-            continue
-        seen.add(d)
-        xmls = _glob.glob(os.path.join(d, "*.xml"))
-        cfgs = _glob.glob(os.path.join(d, "*.cfg"))
-        if not xmls or not cfgs:
-            continue
-        def _pick(paths, *keywords):
-            for kw in keywords:
-                for p in paths:
-                    if kw in os.path.basename(p).lower():
-                        return p
-            return paths[0]
-        ramp = _pick(xmls, "ramp", "default")
-        cfg  = _pick(cfgs, "default")
-        return ramp, cfg
-    return None, None
-
-
-def _apply_ddc(o, xml_files, proj_dir, log):
-    """Add Dynamic Difficulty (beginner-friendly ramped levels) to each instrument
-    arrangement using the EXACT CLI the RocksmithToolkit uses:
-      ddc.exe "file.xml" -l <phraseLen> -s N -m "ramp.xml" -c "cfg.cfg" -p Y -t N
-    DDC overwrites the XML in place (-p Y) and rewrites phrase maxDifficulty to
-    match the levels it generates. Writes _ddc_debug.txt and verifies the level
-    count actually increased so we never silently ship a single-difficulty chart."""
-    ddc_path = _find_exe("ddc") or _find_exe("ddc64")
-    if not ddc_path and getattr(o, "packer_path", ""):
-        _tk = os.path.dirname(o.packer_path)
-        for _dn in (os.path.join("ddc", "ddc.exe"), "ddc.exe", "ddc64.exe"):
-            _dc = os.path.join(_tk, _dn)
-            if os.path.isfile(_dc):
-                ddc_path = _dc
-                break
-    diag = ["DDC DEBUG LOG", f"ddc.exe: {ddc_path}"]
-    if not ddc_path:
-        log("  [DDC] ddc.exe not found — Dynamic Difficulty skipped (chart stays single-difficulty).")
-        return
-    app_dir = os.path.dirname(os.path.abspath(__file__))
-    ramp, cfg = _find_ddc_support(ddc_path, getattr(o, "packer_path", ""), app_dir)
-    diag += [f"ramp model: {ramp}", f"config:     {cfg}"]
-    if not ramp or not cfg:
-        log("  [DDC] DDC support files (ramp-up .xml + .cfg) not found next to ddc.exe or the toolkit.")
-        log("  [DDC]   Copy the toolkit's 'ddc' folder (ddc_default.xml + ddc_default.cfg) next to ddc.exe.")
-        log("  [DDC]   Dynamic Difficulty skipped — chart stays single-difficulty for now.")
-        try:
-            with open(os.path.join(proj_dir, "_ddc_debug.txt"), "w", encoding="utf-8") as f:
-                f.write("\n".join(diag) + "\n\nSupport files missing — DD not applied.\n")
-        except Exception:
-            pass
-        return
-    phrase_len = int(getattr(o, "ddc_phraselength", 256) or 256)
-    log("  [DDC] Applying Dynamic Difficulty (beginner-friendly ramped levels)...")
-    ok_count = 0
-    for xml_file in xml_files:
-        fdir, fname = os.path.dirname(xml_file), os.path.basename(xml_file)
-        cmd = [ddc_path, fname, "-l", str(phrase_len), "-s", "N",
-               "-m", ramp, "-c", cfg, "-p", "Y", "-t", "N"]
-        diag.append("\n" + "=" * 60 + f"\nCMD: {' '.join(cmd)}\n(cwd={fdir})")
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900,
-                               creationflags=CREATE_NO_WINDOW, cwd=fdir)
-            out = ((r.stdout or "") + (r.stderr or "")).strip()
-            diag.append(f"exit={r.returncode}\n{out}")
-            lv = 0
-            try:
-                with open(xml_file, "r", encoding="utf-8", errors="replace") as _xf:
-                    _m = re.search(r'<levels count="(\d+)"', _xf.read())
-                lv = int(_m.group(1)) if _m else 0
-            except Exception:
-                pass
-            diag.append(f"levels after DDC: {lv}")
-            if r.returncode == 0 and lv > 1:
-                ok_count += 1
-                log(f"  [DDC] ✓ {fname}: {lv} difficulty levels")
-            else:
-                log(f"  [DDC] ⚠ {fname}: rc={r.returncode}, levels={lv} (see _ddc_debug.txt)")
-        except Exception as e:
-            diag.append(f"EXCEPTION: {e}")
-            log(f"  [DDC] ⚠ error on {fname}: {e}")
+def _find_rsddc(o=None):
+    """Locate RSDDC_Build2.exe (our DLC Builder-based packer). Returns path or None."""
+    cands = []
+    if o is not None and getattr(o, "rsddc_path", ""):
+        cands.append(o.rsddc_path)
+    # Search every plausible base. IMPORTANT: when frozen, __file__ lives inside
+    # the PyInstaller temp bundle, NOT next to the .exe — so include the exe's
+    # own folder and its parent (RSDDC_Build2 usually sits next to / above dist).
+    bases = []
     try:
-        with open(os.path.join(proj_dir, "_ddc_debug.txt"), "w", encoding="utf-8") as f:
-            f.write("\n".join(diag))
+        bases.append(_get_tools_dir())
     except Exception:
         pass
-    if ok_count == 0:
-        log("  [DDC] No arrangements got DD — chart stays single-difficulty. See _ddc_debug.txt for why.")
-
-
-def _run_packer(o, proj_dir, key, tmpl, result, log):
-    packer = o.packer_path or _find_packer()
-    if not packer: return log("  [psarc] packer.exe not found - skipping build.")
     try:
-        os.makedirs(os.path.join(os.environ.get("TEMP",""), "tmp"), exist_ok=True)
-    except Exception: pass
-    psarc_out = os.path.join(proj_dir, f"{key}_p.psarc")
-    cmd = [packer, "-b", f"-t={tmpl}", f"-o={psarc_out}", "-f=Pc", "-v=RS2014"]
-    log(f"  [psarc] cmd: {' '.join(cmd)}")
-
-    # Full diagnostic log written next to the project so nothing is lost/truncated.
-    diag_path = os.path.join(proj_dir, "_packer_debug.txt")
-    diag_lines = []
-    def _diag(s=""):
-        diag_lines.append(str(s))
-
-    # ── Snapshot of what the packer actually has to work with ──────────────
-    _diag("=" * 70)
-    _diag("RS STUDIO PACKER DEBUG LOG")
-    _diag("packer.exe : " + str(packer))
-    _diag("project dir: " + str(proj_dir))
-    _diag("template   : " + str(tmpl))
-    _diag("output     : " + str(psarc_out))
-    _diag("command    : " + " ".join(cmd))
-    _diag("-" * 70)
-    _diag("PROJECT FOLDER CONTENTS (name — size in bytes):")
+        bases.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    except Exception:
+        pass
+    if getattr(sys, "frozen", False):
+        bases.append(os.path.dirname(sys.executable))
+        bases.append(os.path.dirname(os.path.dirname(sys.executable)))
     try:
-        for fn in sorted(os.listdir(proj_dir)):
-            fp = os.path.join(proj_dir, fn)
-            try: sz = os.path.getsize(fp)
-            except Exception: sz = -1
-            _diag(f"  {fn} — {sz}")
+        bases.append(os.path.dirname(os.path.abspath(__file__)))
+    except Exception:
+        pass
+    bases.append(os.getcwd())
+    for b in bases:
+        if not b:
+            continue
+        cands += [os.path.join(b, "RSDDC_Build2.exe"),
+                  os.path.join(b, "RSDDC_Build2", "RSDDC_Build2.exe"),
+                  os.path.join(b, "tools", "RSDDC_Build2", "RSDDC_Build2.exe")]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def _run_rsddc(exe, proj_path, proj_dir, key, result, log, platform="pc"):
+    """Run RSDDC_Build2.exe on a .rs2dlc for one platform; return True if its
+    .psarc was produced."""
+    cmd = [exe, proj_path]
+    if platform == "mac":
+        cmd += ["--platform", "mac"]
+    log(f"  [psarc] RSDDC_Build2 ({platform}): \"{os.path.basename(proj_path)}\"")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=proj_dir,
+                           creationflags=CREATE_NO_WINDOW)
     except Exception as e:
-        _diag("  (could not list folder: %s)" % e)
-    # Cross-check: do the asset files referenced in the .dlc.xml actually exist?
-    _diag("-" * 70)
-    _diag("ASSET REFERENCE CHECK (files named inside the .dlc.xml):")
-    try:
-        import re as _re_dbg
-        with open(tmpl, "r", encoding="utf-8") as _tf:
-            _txml = _tf.read()
-        _refs = set()
-        for _tag in ("AlbumArtPath", "OggPath", "OggPreviewPath"):
-            _m = _re_dbg.search(rf"<{_tag}>(.*?)</{_tag}>", _txml)
-            if _m and _m.group(1).strip(): _refs.add(_m.group(1).strip())
-        for _m in _re_dbg.finditer(r"<g:File>(.*?)</g:File>", _txml):
-            if _m.group(1).strip(): _refs.add(_m.group(1).strip())
-        for _ref in sorted(_refs):
-            _exists = os.path.isfile(os.path.join(proj_dir, _ref))
-            _diag(f"  {'OK ' if _exists else 'MISSING'}  {_ref}")
-            if not _exists:
-                _diag(f"      ^^ referenced in .dlc.xml but NOT found in project folder")
-    except Exception as e:
-        _diag("  (could not parse template: %s)" % e)
-    _diag("=" * 70)
+        log(f"  [psarc] RSDDC_Build2 error: {e}")
+        return False
+    for line in (r.stdout or "").splitlines():
+        if line.strip():
+            log(f"  [rsddc] {line.rstrip()}")
+    for line in (r.stderr or "").splitlines():
+        if line.strip():
+            log(f"  [rsddc:err] {line.rstrip()}")
+    suf = "_m.psarc" if platform == "mac" else "_p.psarc"
+    p = os.path.join(proj_dir, f"{key}{suf}")
+    if os.path.isfile(p):
+        result["psarc_mac" if platform == "mac" else "psarc"] = p
+        log(f"  [psarc] BUILT via RSDDC_Build2: {os.path.basename(p)}")
+        return True
+    log(f"  [psarc] RSDDC_Build2 ({platform}) produced no .psarc (rc={r.returncode}).")
+    return False
 
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, creationflags=CREATE_NO_WINDOW, cwd=proj_dir)
-        combined = ((r.stdout or "") + (r.stderr or "")).strip()
-        result["packer_output"] = combined
-        _diag("PACKER EXIT CODE: %s" % r.returncode)
-        _diag("PACKER STDOUT:"); _diag(r.stdout or "(empty)")
-        _diag("PACKER STDERR:"); _diag(r.stderr or "(empty)")
-        # Log the FULL output to the console too (not truncated) so it shows in the build window.
-        for line in combined.splitlines():
-            if line.strip(): log(f"  [psarc] {line.rstrip()}")
-        if r.returncode == 0 and os.path.exists(psarc_out):
-            log(f"  [psarc] BUILT: {os.path.basename(psarc_out)}")
-            result["psarc"] = psarc_out
-        else:
-            log(f"  [psarc] packer.exe exited rc={r.returncode}, file exists={os.path.exists(psarc_out)}")
-            result["packer_failed"] = True
-            # On failure, capture packer's own usage text so we can confirm the
-            # exact CLI flags THIS packer.exe build supports (versions differ).
+
+def _try_rsddc_build(o, project, proj_path, proj_dir, key, audio_path, audio_rel, result, log):
+    """Build the .psarc with RSDDC_Build2. Ensures the audio is a .wem and the
+    .rs2dlc points at it (the tool does no audio conversion on its own).
+    Returns True on success, False on failure (failure reason is always logged
+    — there's no fallback packer anymore, so this is the only build path)."""
+    exe = _find_rsddc(o)
+    if not exe:
+        log("  [psarc] RSDDC_Build2.exe not found — PSARC not built.")
+        log("  [psarc] Expected at tools/RSDDC_Build2/RSDDC_Build2.exe next to the app "
+            "(or RSDDC_Build2.exe / RSDDC_Build2/RSDDC_Build2.exe). Re-run the app's "
+            "auto-setup or reinstall it if it's missing.")
+        return False
+    log(f"  [psarc] Using RSDDC_Build2 (DLC Builder packer + DD): {exe}")
+    wem_rel = audio_rel
+    if audio_rel and not audio_rel.lower().endswith(".wem"):
+        # Try to pre-make a .wem (needs CST's Wwise template). If that's not
+        # available, DON'T bail — RSDDC_Build2 bundles Rocksmith2014.Conversion
+        # and converts the WAV itself, so just leave the project pointing at the
+        # .wav and let the packer handle it.
+        converted = False
+        if wwise_convert is not None:
             try:
-                h = subprocess.run([packer, "--help"], capture_output=True, text=True,
-                                   timeout=30, creationflags=CREATE_NO_WINDOW)
-                _diag("-" * 70)
-                _diag("PACKER --help OUTPUT:")
-                _diag((h.stdout or "") + (h.stderr or "") or "(no help text)")
-            except Exception as he:
-                _diag("(packer --help failed: %s)" % he)
-    except Exception as e:
-        log(f"  [psarc] exception: {e}")
-        _diag("PYTHON EXCEPTION running packer: %s" % e)
-        result["packer_failed"] = True
-
-    # Always write the debug log.
-    try:
-        with open(diag_path, "w", encoding="utf-8") as _df:
-            _df.write("\n".join(diag_lines))
-        log(f"  [psarc] Full debug log written: {diag_path}")
-    except Exception as e:
-        log(f"  [psarc] (could not write debug log: {e})")
-
-def _write_dds_bgra(img_path, out_path):
-    """Write a 512x512 uncompressed BGRA DDS — Pillow only, no ffmpeg needed."""
-    import struct
-    from PIL import Image as _PI
-    img = _PI.open(img_path).convert("RGBA").resize((512, 512))
-    r, g, b, a = img.split()
-    bgra = _PI.merge("RGBA", (b, g, r, a))
-    raw = bgra.tobytes()
-    w = h = 512
-    hdr  = b"DDS "
-    hdr += struct.pack("<I", 124)                     # dwSize
-    hdr += struct.pack("<IIIII", 0x0010100F, h, w, w * 4, 0)  # flags,h,w,pitch,depth
-    hdr += struct.pack("<I", 0) + b"\x00" * 44        # mipCount + reserved
-    # DDPIXELFORMAT — 8 uint32s = 32 bytes; FourCC=0 (uncompressed BGRA)
-    hdr += struct.pack("<IIIIIIII",
-        32, 0x41, 0, 32,
-        0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
-    hdr += struct.pack("<IIIII", 0x1000, 0, 0, 0, 0)  # DDSCAPS
-    assert len(hdr) == 128
-    with open(out_path, "wb") as f:
-        f.write(hdr)
-        f.write(raw)
-
-
-def _prepare_art_for_packer(src_art, proj_dir, key, log):
-    """Convert album art to 512x512 uncompressed BGRA DDS for packer.exe."""
-    dds_out = os.path.join(proj_dir, f"{key}_art.dds")
-    try:
-        _write_dds_bgra(src_art, dds_out)
-        if os.path.getsize(dds_out) > 1000:
-            log(f"  [art] DDS ready: {os.path.basename(dds_out)}")
-            return dds_out
-    except Exception as e:
-        log(f"  [art] DDS write failed ({e}), using original")
-    return src_art
+                dest_wem = os.path.join(proj_dir, os.path.splitext(audio_rel)[0] + ".wem")
+                wem, prev = wwise_convert.wav_to_wem(
+                    os.path.join(proj_dir, audio_rel), dest_wem, work_root=proj_dir,
+                    ffmpeg=_find_exe("ffmpeg"), log=log)
+                wem_rel = os.path.basename(wem)
+                project["AudioFile"]["Path"] = wem_rel
+                project["AudioPreviewFile"]["Path"] = os.path.basename(prev)
+                with open(proj_path, "w", encoding="utf-8") as f:
+                    json.dump(project, f, indent=2)
+                converted = True
+            except Exception as e:
+                log(f"  [psarc] Wwise→wem unavailable ({e}).")
+        if not converted:
+            log("  [psarc] Letting RSDDC_Build2 convert the WAV internally "
+                "(no CST Wwise template needed).")
+            # project already references the .wav (audio_rel) — leave it as-is
+    ok = _run_rsddc(exe, proj_path, proj_dir, key, result, log, "pc")
+    if ok and getattr(o, "build_mac", True):
+        # CF encourages a Mac _m.psarc too; build it from the same project.
+        _run_rsddc(exe, proj_path, proj_dir, key, result, log, "mac")
+    return ok
 
 
 def build_project(o, log=print):
@@ -1162,9 +1222,24 @@ def build_project(o, log=print):
     proj_dir = os.path.join(o.out_dir, _folder)
     os.makedirs(proj_dir, exist_ok=True)
     log(f"Building Project: {proj_dir}")
-    xml_files_for_ddc = []
     result = {"proj_dir": proj_dir, "psarc": None, "packer_failed": False, "packer_output": ""}
-    audio_path = ensure_wav(o.audio_path, proj_dir, log, leadin=o.leadin) if o.audio_path else None
+    # CF standard: fixed 10s lead-in silence (floored) + 2s tail on the AUDIO.
+    # The "Song Delay" field is now a small NOTE OFFSET; the chart starts at
+    # 10s + offset so the notes line up with the padded audio (music at t=10s).
+    _offset = float(getattr(o, "leadin", 0) or 0)
+    _sil = max(LEAD_SILENCE, 0.0)            # enforce the 10s minimum
+    _chart_lead = _sil + _offset
+    if o.audio_path:
+        check_audio_quality(o.audio_path, log)
+    audio_path = ensure_wav(o.audio_path, proj_dir, log, leadin=_sil, tail=TAIL_SILENCE) if o.audio_path else None
+
+    # Auto volume (DLC Builder parity): measure the ORIGINAL audio's loudness and
+    # set the Rocksmith volume to match ODLC, unless the user disabled it.
+    _vol = float(o.volume)
+    if getattr(o, "auto_volume", True) and o.audio_path:
+        _av = _auto_volume(o.audio_path, log)
+        if _av is not None:
+            _vol = _av
 
     # Compute bpm_scale using only bars that actually contain notes.
     # Plain extract_gp_total_seconds includes trailing empty bars (very common in GP files),
@@ -1178,45 +1253,95 @@ def build_project(o, log=print):
             log(f"  [sync] GP content={gp_dur:.1f}s  Audio={aud_dur:.1f}s  (no BPM scaling applied)")
 
     arrangements, tones, used = [], [], set()
-    cst_arrs, cst_tones = [], []
     # Pass audio_duration so make_arrangement can set SongLength to cover the full audio
     _audio_dur_for_xml = None
     if o.audio_path and os.path.exists(o.audio_path):
         _audio_dur_for_xml = get_wav_duration(o.audio_path)
-    args = SimpleNamespace(arr="Lead", leadin=o.leadin, title=o.title, artist=o.artist,
+    args = SimpleNamespace(arr="Lead", leadin=_chart_lead, title=o.title, artist=o.artist,
                            album=o.album, year=o.year, bpm_scale=bpm_scale,
                            audio_duration=_audio_dur_for_xml)
     for trk in o.tracks:
         if not trk["include"] or trk["arr"] == "Skip": continue
-        args.arr = trk["arr"]
-        xml, _, _, _ = gp2rs.make_arrangement(gp, trk["index"], args)
-        xml_name = f"{key}_{trk['arr'].lower()}.xml"
-        xml_full = os.path.join(proj_dir, xml_name)
-        with open(xml_full, "w", encoding="utf-8") as f: f.write(xml)
-        xml_files_for_ddc.append(xml_full)
-        tone_key = f"{key.lower()}_{trk['arr'].lower()}"
+        arr = trk["arr"]
+        is_bonus = arr in ARR_BONUS_BASE
+        is_bass  = (ARR_KIND.get(arr) == "bass")
+        slug = _arr_slug(arr)
+        # A bonus path charts as its base type (Rhythm/Lead), flagged bonus.
+        args.arr = ARR_BONUS_BASE.get(arr, arr)
+        tone_key = f"{key.lower()}_{slug}"
         if tone_key not in used:
             t = json.loads(json.dumps(TONE_PRESETS[trk["tone_label"]]))
             t["Key"] = t["Name"] = tone_key
             tones.append(t)
-            cst_tones.append(preset_to_tone2014(TONE_PRESETS[trk["tone_label"]], tone_key))
             used.add(tone_key)
+
+        # ── Tone changes: Rocksmith allows up to 4 named tones (slots A-D) on
+        # top of the BaseTone (the one active when the song starts — it can
+        # never be explicitly re-selected later, only switched AWAY from).
+        # trk["tone_changes"] is [{"time": seconds, "tone_label": preset_name}],
+        # entered on the Main tab. Slots are assigned in order of first
+        # appearance so repeated switches to the same preset reuse one slot.
+        _changes = sorted((trk.get("tone_changes") or []), key=lambda e: e["time"])
+        _slot_labels = []
+        for _ev in _changes:
+            if _ev["tone_label"] not in _slot_labels:
+                _slot_labels.append(_ev["tone_label"])
+        if len(_slot_labels) > 4:
+            log(f"  [tone] {arr}: {len(_slot_labels)} different tone-change presets, "
+                f"Rocksmith only supports 4 — keeping the first 4 used "
+                f"({', '.join(_slot_labels[:4])}), dropping the rest.")
+            _slot_labels = _slot_labels[:4]
+        _slot_keys = []
+        for _si, _label in enumerate(_slot_labels):
+            _skey = f"{tone_key}_{'abcd'[_si]}"
+            if _skey not in used:
+                _st = json.loads(json.dumps(TONE_PRESETS[_label]))
+                _st["Key"] = _st["Name"] = _skey
+                tones.append(_st)
+                used.add(_skey)
+            _slot_keys.append(_skey)
+        args.tone_events = [(_ev["time"], _slot_labels.index(_ev["tone_label"]))
+                             for _ev in _changes if _ev["tone_label"] in _slot_labels]
+
+        xml, _, _, _ = gp2rs.make_arrangement(gp, trk["index"], args)
+        xml_name = f"{key}_{slug}.xml"
+        xml_full = os.path.join(proj_dir, xml_name)
+        with open(xml_full, "w", encoding="utf-8") as f: f.write(xml)
         tun, _ = gp.effective_tuning(trk["index"])
-        ref = gp2rs.STD_BASS if trk["arr"] == "Bass" else gp2rs.STD_TUNING
+        ref = gp2rs.STD_BASS if is_bass else gp2rs.STD_TUNING
         offs = [tun[i] - ref[i] for i in range(min(len(ref), len(tun)))]
         offs += [0] * (6 - len(offs))
-        arrangements.append({
-            "Case": "Instrumental",
-            "Fields": [{
-                "XML": xml_name, "Name": ARR_ENUM[trk["arr"]][0], "RouteMask": ARR_ENUM[trk["arr"]][1],
-                "ScrollSpeed": float(o.scroll_speed), "TuningPitch": float(o.pitch),
-                "Tuning": offs, "BaseTone": tone_key, "Tones": [],
-                "MasterID": random.randint(1, 2**31 - 1), "PersistentID": str(uuid.uuid4())
-            }]
-        })
-        cst_arrs.append(dict(arr_name=trk["arr"], arr_type={"Lead": "Guitar", "Rhythm": "Guitar", "Bass": "Bass"}[trk["arr"]], route_mask=trk["arr"], xml_path=xml_full, master_id=random.randint(1, 2**31 - 1), id=uuid.uuid4(), tone_key=tone_key, tuning=offs, tuning_pitch=float(o.pitch), tuning_name="Custom", scroll=int(round(float(o.scroll_speed)*10))))
+        # Low-bass-tuning workaround (matches make_arrangement + DLC Builder): a
+        # very low bass is raised an octave with TuningPitch dropped to 220 Hz.
+        offs, _pitch = gp2rs.apply_low_bass_fix(offs, is_bass, float(o.pitch))
+        _arr_fields = {
+            "XML": xml_name, "Name": ARR_ENUM[arr][0], "RouteMask": ARR_ENUM[arr][1],
+            "ScrollSpeed": float(o.scroll_speed), "TuningPitch": _pitch,
+            "Tuning": offs, "BaseTone": tone_key, "Tones": _slot_keys,
+            "MasterID": random.randint(1, 2**31 - 1), "PersistentID": str(uuid.uuid4())
+        }
+        if is_bonus:
+            _arr_fields["BonusArr"] = 1   # mark as a bonus (second same-type) path
+        arrangements.append({"Case": "Instrumental", "Fields": [_arr_fields]})
     vocals_name = None
-    if o.lyrics_path:
+    _vxml = None
+    _voc_source_text = None     # plain lyric text, for custom-font detection
+    # Prefer lyrics EMBEDDED in the .gp — Official tabs carry them already timed
+    # to the beats, so no fetch / Whisper-align / manual drag is needed.
+    try:
+        _emb = gp2rs.gp_lyrics_to_vocals(gp, _chart_lead)
+    except Exception as _ee:
+        _emb = None
+        log(f"  [vocals] embedded-lyric read failed: {_ee}")
+    if _emb:
+        _vxml = _emb
+        log("  [vocals] Using lyrics embedded in the GP (beat-aligned).")
+        try:
+            _ti_e, _lines_e = gp2rs.gp_embedded_lyrics(gp)
+            _voc_source_text = "\n".join(t for _o, t in _lines_e)
+        except Exception:
+            _voc_source_text = None
+    elif o.lyrics_path:
         _lrc_off = getattr(o, "lrc_offset", 0.0)
         # Prefer .lrc over .txt — Whisper may have finished after vars_ was snapshotted
         _eff_lyrics = o.lyrics_path
@@ -1225,11 +1350,34 @@ def build_project(o, log=print):
             if os.path.isfile(_adj_lrc):
                 _eff_lyrics = _adj_lrc
                 log(f"  [vocals] Using adjacent LRC: {os.path.basename(_adj_lrc)}")
-        vxml = gp2rs.lrc_to_vocals(_eff_lyrics, o.leadin, lrc_offset=_lrc_off) if _eff_lyrics.endswith(".lrc") else gp2rs.lyrics_txt_to_vocals(_eff_lyrics, gp, o.leadin)
+        _vxml = gp2rs.lrc_to_vocals(_eff_lyrics, _chart_lead, lrc_offset=_lrc_off) if _eff_lyrics.endswith(".lrc") else gp2rs.lyrics_txt_to_vocals(_eff_lyrics, gp, _chart_lead)
+        try:
+            with open(_eff_lyrics, "r", encoding="utf-8", errors="replace") as _vf:
+                _voc_source_text = _vf.read()
+        except Exception:
+            _voc_source_text = None
+
+    if _vxml:
         vname = f"{key}_vocals.xml"
         vocals_name = vname
-        with open(os.path.join(proj_dir, vname), "w", encoding="utf-8") as f: f.write(vxml)
-        arrangements.append({"Case": "Vocals", "Fields": [{"XML": vname, "Japanese": False, "MasterID": random.randint(1, 2**31 - 1), "PersistentID": str(uuid.uuid4())}]})
+        with open(os.path.join(proj_dir, vname), "w", encoding="utf-8") as f: f.write(_vxml)
+        # Non-Latin lyrics (Japanese/Cyrillic/etc.) need a custom glyph atlas, or
+        # they render blank in-game. Generate one and point the Vocals CustomFont
+        # at it; the build packs it. Default lyrics.dds only covers Latin.
+        _voc_fields = {"XML": vname, "Japanese": False,
+                       "MasterID": random.randint(1, 2**31 - 1),
+                       "PersistentID": str(uuid.uuid4())}
+        try:
+            import lyric_font as _lf
+            if _voc_source_text and _lf.needs_custom_font(_voc_source_text):
+                _plain = [ln.strip() for ln in _voc_source_text.splitlines() if ln.strip()]
+                _res = _lf.generate(_plain, proj_dir, f"{key}_lyricfont", log)
+                if _res:
+                    _voc_fields["Japanese"] = True
+                    _voc_fields["CustomFont"] = os.path.basename(_res["dds"])
+        except Exception as _fe:
+            log(f"  [vocals] custom font generation skipped: {_fe}")
+        arrangements.append({"Case": "Vocals", "Fields": [_voc_fields]})
     audio_rel, preview_rel, art_rel = "", "", ""
     if audio_path:
         audio_rel = os.path.basename(audio_path)
@@ -1241,58 +1389,47 @@ def build_project(o, log=print):
         art_rel = os.path.basename(o.art_path)
         if os.path.abspath(o.art_path) != os.path.abspath(os.path.join(proj_dir, art_rel)): shutil.copy2(o.art_path, os.path.join(proj_dir, art_rel))
     project = {
-        "Version": "1", "DLCKey": key, "AppId": str(o.appid),
+        "Version": "1.0", "DLCKey": key, "AppId": str(o.appid),
         "ArtistName": {"Value": o.artist, "SortValue": sort_value(o.artist)},
         "Title": {"Value": o.title, "SortValue": sort_value(o.title)},
         "AlbumName": {"Value": o.album, "SortValue": sort_value(o.album)},
         "Year": int(o.year) if str(o.year).isdigit() else 2026, "AlbumArtFile": art_rel,
-        "AudioFile": {"Path": audio_rel, "Volume": float(o.volume)},
-        "AudioPreviewFile": {"Path": preview_rel, "Volume": float(o.volume)},
+        "AudioFile": {"Path": audio_rel, "Volume": _vol},
+        "AudioPreviewFile": {"Path": preview_rel, "Volume": _vol},
         "Arrangements": arrangements, "Tones": tones
     }
     proj_path = os.path.join(proj_dir, f"{key}.rs2dlc")
     with open(proj_path, "w", encoding="utf-8") as f: json.dump(project, f, indent=2)
-    if getattr(o, "use_ddc", False):
-        _apply_ddc(o, xml_files_for_ddc, proj_dir, log)
     if getattr(o, "make_psarc", False):
-        if cst_template is not None:
-            # Full Wwise + CST path
-            wem_rel = audio_rel
-            if audio_path and wwise_convert is not None:
-                try:
-                    dest_wem = os.path.join(proj_dir, os.path.splitext(audio_rel)[0] + ".wem")
-                    wem, prev = wwise_convert.wav_to_wem(os.path.join(proj_dir, audio_rel), dest_wem, work_root=proj_dir, cst_hint=o.cst_dir or o.packer_path or None, ffmpeg=_find_exe("ffmpeg"), log=log)
-                    wem_rel = os.path.basename(wem); preview_rel = os.path.basename(prev)
-                except Exception as e:
-                    log(f"  [psarc] Wwise conversion failed: {e}"); wem_rel = None
-            if wem_rel:
-                # Pre-convert art to DDS so packer doesn't try its own broken temp-dir conversion.
-                # Packer's DDS conversion writes to AppData\Local\Temp\tmp\ which often
-                # doesn't exist, causing "Could not find file" errors.
-                art_abs = ""
-                if art_rel:
-                    src_art = os.path.join(proj_dir, art_rel)
-                    if os.path.exists(src_art):
-                        art_abs = _prepare_art_for_packer(src_art, proj_dir, key, log)
-                    else:
-                        art_abs = src_art
+        # RSDDC_Build2 (DLC Builder's packer) is the only build path — it
+        # generates Dynamic Difficulty itself, so there's no separate DDC step
+        # and nothing to fall back to. Failure reasons are logged inside
+        # _try_rsddc_build / _run_rsddc so they're always visible here.
+        _did_rsddc = _try_rsddc_build(o, project, proj_path, proj_dir, key,
+                                      audio_path, audio_rel, result, log)
+        if not _did_rsddc:
+            log("  [psarc] PSARC not built — see the [psarc]/[rsddc] lines above for why.")
+            result["packer_failed"] = True
 
-                tmpl = cst_template.build_dlc_xml(dict(
-                    dlc_key=key, title=o.title, artist=o.artist, album=o.album,
-                    year=int(o.year) if str(o.year).isdigit() else 2026,
-                    avg_tempo=int(round(getattr(o, "bpm", 120) or 120)), art_path=art_abs,
-                    audio_path=wem_rel or "", audio_preview_path=preview_rel,
-                    vocals_xml=vocals_name, volume=float(o.volume),
-                    preview_volume=float(o.volume)
-                ), cst_arrs, cst_tones, os.path.join(proj_dir, f"{key}.dlc.xml"))
-                _run_packer(o, proj_dir, key, tmpl, result, log)
-            # If packer failed, log a clear hint
-            if result.get("packer_failed"):
-                log("  [psarc] Build failed. The .rs2dlc and .dlc.xml are in the project folder.")
-                log("  [psarc] Open the .rs2dlc in RocksmithToolkitGUI to build manually if needed.")
-        else:
-            log("  [psarc] cst_template.py not found — PSARC skipped.")
-            log("  [psarc] Place cst_template.py next to gp2rs_studio.py to enable auto-build.")
+    # CF upload naming: rename outputs to "Artist - Song Title - Version" while
+    # keeping the required _p.psarc / _m.psarc suffix.
+    import re as _rn
+    def _san(s): return _rn.sub(r'[\\/:*?"<>|]', "", str(s)).strip()
+    _cf_base = f"{_san(o.artist)} - {_san(o.title)} - {getattr(o, 'version', '1.0')}"
+    for _k, _suf in (("psarc", "_p.psarc"), ("psarc_mac", "_m.psarc")):
+        _p = result.get(_k)
+        if _p and os.path.isfile(_p):
+            _np = os.path.join(os.path.dirname(_p), _cf_base + _suf)
+            try:
+                if os.path.abspath(_np) != os.path.abspath(_p):
+                    if os.path.exists(_np):
+                        os.remove(_np)
+                    os.replace(_p, _np)
+                    result[_k] = _np
+                    log(f"  [psarc] renamed -> {os.path.basename(_np)}")
+            except Exception as _re:
+                log(f"  [psarc] rename failed: {_re}")
+
     log(f"\nDONE. Project saved to {proj_dir}")
     return result
 
@@ -1319,7 +1456,7 @@ def _load_logo(size=80):
 
 def run_gui():
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk, colorchooser
+    from tkinter import filedialog, messagebox, ttk, colorchooser, simpledialog
 
     root = tk.Tk()
     root.title("RS STUDIO")
@@ -1338,13 +1475,13 @@ def run_gui():
 
     apply_ttk_theme(root, ttk)
 
-    vars_ = {k: tk.StringVar() for k in ["gp", "lyrics", "audio", "preview_audio", "art", "out", "psarc_out", "title", "artist", "album", "year", "leadin", "volume", "audio_url", "packer", "cst", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "bpm", "bpm_factor", "lrc_offset"]}
-    vars_["leadin"].set("5.0"); vars_["volume"].set("-8.0"); vars_["year"].set("2026"); vars_["bpm"].set("120"); vars_["bpm_factor"].set("1.000"); vars_["lrc_offset"].set("0.0")
+    vars_ = {k: tk.StringVar() for k in ["gp", "lyrics", "audio", "preview_audio", "art", "out", "psarc_out", "title", "artist", "album", "year", "leadin", "volume", "audio_url", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "bpm", "bpm_factor", "lrc_offset"]}
+    vars_["leadin"].set("0.0"); vars_["volume"].set("-8.0"); vars_["year"].set("2026"); vars_["bpm"].set("120"); vars_["bpm_factor"].set("1.000"); vars_["lrc_offset"].set("0.0")
     vars_["slop_url"].set("http://localhost:8000")
     vars_["appid"].set("248750"); vars_["scroll_speed"].set("1.3"); vars_["pitch"].set("440.0")
     # Restore persisted paths from settings
     _s = load_settings()
-    for _k in ("packer", "cst", "out", "psarc_out", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "volume", "leadin"):
+    for _k in ("out", "psarc_out", "slop_url", "slop_exe", "slop_plugin_dir", "appid", "scroll_speed", "pitch", "volume", "leadin"):
         if _s.get(_k): vars_[_k].set(_s[_k])
     # Default project folder to <exe dir>/RS Studio Projects if never set
     if not vars_["out"].get():
@@ -1353,15 +1490,7 @@ def run_gui():
         os.makedirs(_default_out, exist_ok=True)
         vars_["out"].set(_default_out)
 
-    psarc_var = tk.BooleanVar(value=True); use_ddc = tk.BooleanVar(value=True)
-    # Auto-probe for packer.exe if not saved yet
-    def _probe_packer_async():
-        if not vars_["packer"].get():
-            found = _find_packer()
-            if found:
-                root.after(0, lambda: vars_["packer"].set(found))
-                root.after(0, lambda: log(f"  [packer] auto-found: {found}"))
-    threading.Thread(target=_probe_packer_async, daemon=True).start()
+    psarc_var = tk.BooleanVar(value=True)
 
     # Tools are downloaded on the startup screen (see _show_setup_screen below)
 
@@ -1389,6 +1518,56 @@ def run_gui():
                 root.after(2000, _poll)
         root.after(2000, _poll)
 
+    def _ensure_pdf2gp_deps(callback):
+        """Make sure pdf2gp.py (PDF tab -> .gp5 import) can be imported, then run
+        callback() on the UI thread. In a frozen .exe build these packages are
+        bundled at compile time (see build_exe.bat) — if the import still fails
+        there, the build was made without pdf2gp.py present. When running from
+        source, missing packages (opencv-python, pikepdf, pdfplumber,
+        pdfminer.six) are pip-installed silently on first use, same as Pillow."""
+        global pdf2gp
+        if pdf2gp is not None:
+            callback()
+            return
+        if getattr(sys, "frozen", False):
+            if PDF2GP_IMPORT_ERROR:
+                # pdf2gp.py WAS bundled but failed to import at runtime (e.g. a
+                # missing DLL for cv2/pikepdf inside the frozen build) — show the
+                # real reason instead of the generic "not bundled" message so
+                # this doesn't get mistaken for the same issue again.
+                messagebox.showerror(
+                    "PDF import unavailable",
+                    "pdf2gp was bundled into this build but failed to load:\n\n"
+                    + PDF2GP_IMPORT_ERROR)
+            else:
+                messagebox.showerror(
+                    "PDF import unavailable",
+                    "This build was compiled without PDF-to-GP support.\n"
+                    "Re-run build_exe.bat with pdf2gp.py present in the app folder to enable it.")
+            return
+        log("  [pdf2gp] installing PDF-import dependencies (first use only)…")
+
+        def _worker():
+            global pdf2gp
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--quiet",
+                     "opencv-python", "numpy", "pikepdf", "pdfplumber",
+                     "pdfminer.six", "pyguitarpro"],
+                    creationflags=CREATE_NO_WINDOW)
+            except Exception as e:
+                root.after(0, lambda: messagebox.showerror("Install failed", str(e)))
+                return
+            try:
+                import importlib
+                pdf2gp = importlib.import_module("pdf2gp")
+            except Exception as e:
+                root.after(0, lambda: messagebox.showerror(
+                    "PDF import unavailable", f"Couldn't load PDF-to-GP support:\n{e}"))
+                return
+            root.after(0, callback)
+        threading.Thread(target=_worker, daemon=True).start()
+
     # ══════════════════════════════════════════════════════════════════════
     # SIDEBAR
     # ══════════════════════════════════════════════════════════════════════
@@ -1413,10 +1592,11 @@ def run_gui():
 
     nav_label(sidebar, 3, "⬡", "Main", "main")
     nav_label(sidebar, 4, "🎯", "Sync", "sync")
-    nav_label(sidebar, 5, "◐", "Theme", "theme"); nav_label(sidebar, 6, "≡", "Log", "log")
-    nav_label(sidebar, 7, "?", "Help", "help")
+    nav_label(sidebar, 5, "🎚", "Tone", "tone")
+    nav_label(sidebar, 6, "◐", "Theme", "theme"); nav_label(sidebar, 7, "≡", "Log", "log")
+    nav_label(sidebar, 8, "?", "Help", "help")
 
-    sidebar.rowconfigure(9, weight=1)
+    sidebar.rowconfigure(10, weight=1)
 
     page_container = styled(tk.Frame(root), bg="surface")
     page_container.grid(row=0, column=1, sticky="nsew"); page_container.rowconfigure(0, weight=1); page_container.columnconfigure(0, weight=1)
@@ -1455,8 +1635,8 @@ def run_gui():
                 pass
 
     def _persist_settings(*_):
-        save_settings({k: vars_[k].get() for k in ("packer","cst","out","psarc_out","slop_url","slop_exe","slop_plugin_dir","appid","scroll_speed","pitch","volume","leadin")})
-    for _pk in ("packer","cst","out","psarc_out","slop_url","slop_exe","slop_plugin_dir","appid","scroll_speed","pitch","volume","leadin"):
+        save_settings({k: vars_[k].get() for k in ("out","psarc_out","slop_url","slop_exe","slop_plugin_dir","appid","scroll_speed","pitch","volume","leadin")})
+    for _pk in ("out","psarc_out","slop_url","slop_exe","slop_plugin_dir","appid","scroll_speed","pitch","volume","leadin"):
         vars_[_pk].trace_add("write", _persist_settings)
 
     def page_header(parent, text):
@@ -1523,6 +1703,85 @@ def run_gui():
               activebackground=COL["border_hi"],
               command=_do_new_project).pack(side="right")
 
+    def _load_gp_dialog():
+        """Open a .gp you downloaded yourself (e.g. from Ultimate Guitar in your
+        own browser) and load it."""
+        p = filedialog.askopenfilename(
+            title="Open Guitar Pro file",
+            filetypes=[("Guitar Pro", "*.gp *.gp3 *.gp4 *.gp5 *.gpx *.gp7"),
+                       ("All files", "*.*")])
+        if p:
+            load_gp(p)
+
+    tk.Button(_main_inner, text="📁  Load .gp", cursor="hand2",
+              font=("Segoe UI Semibold", 9), relief="flat", bd=0,
+              padx=14, pady=5,
+              bg=COL["card2"], fg=COL["fg"],
+              activebackground=COL["border_hi"],
+              command=_load_gp_dialog).pack(side="right", padx=(0, 8))
+
+    def _import_pdf_dialog():
+        """Build a .gp5 straight from Ultimate Guitar print-to-PDF tab(s) — no
+        Guitar Pro app needed — then load it, same as picking a .gp file.
+        Lyrics are handled automatically (auto-fetched from lrclib.net, falling
+        back to OCR text) — no extra prompt. Power users can still drop a
+        matching lyrics .txt next to the PDFs beforehand for the cleanest
+        result; pdf2gp picks that up on its own without being asked."""
+        paths = filedialog.askopenfilenames(
+            title="Select 1-3 print-to-PDF tabs for ONE song (bass/lead/rhythm)",
+            filetypes=[("PDF tabs", "*.pdf"), ("All files", "*.*")])
+        if not paths:
+            return
+        paths = list(paths)
+        _ensure_pdf2gp_deps(lambda: _run_pdf2gp(paths))
+
+    def _run_pdf2gp(pdf_paths):
+        btn_import_pdf.configure(text="Converting…", state="disabled")
+        log(f"  [pdf2gp] converting {len(pdf_paths)} PDF tab(s)…")
+
+        def _worker():
+            import contextlib, io as _io
+            buf = _io.StringIO()
+            out_path = None
+            err = None
+            try:
+                out_dir = os.path.dirname(os.path.abspath(pdf_paths[0]))
+                # NOTE: redirect_stdout is process-wide for the duration of the
+                # call — fine here since this is the only thing printing during
+                # a PDF import (mirrors the CLI tool's own print()-based logging).
+                with contextlib.redirect_stdout(buf):
+                    out_path = pdf2gp.convert(pdf_paths, out_path=os.path.join(out_dir, "song.gp5"))
+            except Exception as e:
+                err = e
+            for line in buf.getvalue().splitlines():
+                if line.strip():
+                    root.after(0, lambda l=line: log(f"  [pdf2gp] {l}"))
+            root.after(0, lambda: btn_import_pdf.configure(text="📄  Import PDF Tab", state="normal"))
+            if err is not None:
+                root.after(0, lambda e=err: messagebox.showerror("PDF conversion failed", str(e)))
+                root.after(0, lambda e=err: log(f"  [pdf2gp] ERROR: {e}"))
+            else:
+                lrc_path = os.path.splitext(out_path)[0] + ".lrc"
+                def _load_with_lyrics(_gp=out_path, _lrc=lrc_path):
+                    load_gp(_gp)
+                    # load_gp() clears the lyrics field for a fresh project, so set
+                    # this AFTER it — and before any auto-fetch dialog can run — so
+                    # RS Studio uses the .lrc pdf2gp already built from the tab
+                    # instead of re-fetching/regenerating lyrics from scratch.
+                    if os.path.exists(_lrc):
+                        vars_["lyrics"].set(_lrc)
+                        log(f"  [pdf2gp] using lyrics from {os.path.basename(_lrc)} (auto-fetch will skip lyrics)")
+                root.after(0, _load_with_lyrics)
+        threading.Thread(target=_worker, daemon=True).start()
+
+    btn_import_pdf = tk.Button(_main_inner, text="📄  Import PDF Tab", cursor="hand2",
+              font=("Segoe UI Semibold", 9), relief="flat", bd=0,
+              padx=14, pady=5,
+              bg=COL["card2"], fg=COL["fg"],
+              activebackground=COL["border_hi"],
+              command=_import_pdf_dialog)
+    btn_import_pdf.pack(side="right", padx=(0, 8))
+
     def _update_next_btn(*_):
         gp  = vars_["gp"].get().strip()
         aud = vars_["audio"].get().strip()
@@ -1578,6 +1837,14 @@ def run_gui():
 
     def _show_setup_screen():
         """First-time setup: download missing tools with progress bar, then show normal splash."""
+        # Run at most once per session. Without this, a tool that can't auto-
+        # install (e.g. pip unavailable) would leave the gate unsatisfied and the
+        # setup screen — and any warnings — would reopen on every loop.
+        if _setup_ran[0]:
+            _overlay_shown[0] = False
+            root.after(0, _show_startup_overlay)
+            return
+        _setup_ran[0] = True
         for w in startup_overlay.winfo_children():
             w.destroy()
         startup_overlay.place(x=0, y=0, relwidth=1, relheight=1)
@@ -1606,10 +1873,12 @@ def run_gui():
             return (importlib.util.find_spec("stable_whisper") is not None or
                     importlib.util.find_spec("faster_whisper") is not None)
 
+        # NOTE: standalone DDC (ddc.exe) is intentionally NOT here — Dynamic
+        # Difficulty is generated by the DLC Builder packer (RSDDC_Build2), so the
+        # old, often-unavailable ddc.exe is not required.
         _TOOL_ROWS = [
             ("ytdlp",   "yt-dlp",          lambda: bool(_find_exe("yt-dlp"))),
             ("ffmpeg",  "ffmpeg + ffplay",  lambda: bool(_find_exe("ffmpeg") and _find_exe("ffplay"))),
-            ("ddc",     "DDC",              lambda: bool(_find_exe("ddc") or _find_exe("ddc64"))),
             ("whisper", "AI Timestamps",    _whisper_ok),
         ]
         tv, tl = {}, {}
@@ -1655,6 +1924,20 @@ def run_gui():
         def _worker():
             tools = _get_tools_dir()
             _FFMPEG_EXES = {"ffmpeg.exe", "ffprobe.exe", "ffplay.exe"}
+
+            # Pick a Python to pip-install into. NEVER use sys.executable when
+            # frozen — there it's RS STUDIO.exe, and "exe -m pip ..." relaunches
+            # the app (infinite windows). When frozen, install into the external
+            # real Python instead; if none, skip pip steps entirely.
+            import sys as _sysp
+            _pip_py = _sysp.executable
+            if getattr(_sysp, "frozen", False):
+                _pip_py = None
+                try:
+                    import lyrics_align as _la_pip
+                    _pip_py = _la_pip.real_python()
+                except Exception:
+                    _pip_py = None
 
             # --- yt-dlp ---
             if not _find_exe("yt-dlp"):
@@ -1709,75 +1992,38 @@ def run_gui():
                 except Exception as e:
                     _mark_err("ffmpeg", "ffmpeg + ffplay")
                     log(f"  [setup] ffmpeg failed: {e}")
-            _set_pb(80)
+            _set_pb(82)
 
-            # --- DDC ---
-            def _find_ddc_anywhere():
-                found = _find_exe("ddc") or _find_exe("ddc64")
-                if found: return found
-                packer_path = load_settings().get("packer", "")
-                if packer_path and os.path.isfile(packer_path):
-                    for _r, _d, _f in os.walk(os.path.dirname(packer_path)):
-                        if os.path.relpath(_r, os.path.dirname(packer_path)).count(os.sep) > 2: _d[:] = []; continue
-                        for _fn in ("ddc.exe", "ddc64.exe"):
-                            if _fn in _f:
-                                _found = os.path.join(_r, _fn)
-                                try: shutil.copy2(_found, os.path.join(tools, _fn))
-                                except Exception: pass
-                                return _found
-                return None
-
-            if not _find_ddc_anywhere():
-                root.after(0, lambda: tv["ddc"].set("⬇  DDC…"))
-                _set_status("Downloading DDC…")
-                _ddc_dest = os.path.join(tools, "ddc.exe")
-                _ddc_ok = False
-                for _u in [
-                    "https://github.com/rscustom/rocksmith-custom-song-toolkit/raw/master/Third-party%20Apps/ddc/ddc.exe",
-                    "https://github.com/iminashi/DDCImprover/raw/master/DDCImprover.Core/ddc.exe",
-                ]:
-                    try:
-                        urllib.request.urlretrieve(_u, _ddc_dest)
-                        if os.path.exists(_ddc_dest) and os.path.getsize(_ddc_dest) > 10000: _ddc_ok = True; break
-                        elif os.path.exists(_ddc_dest): os.remove(_ddc_dest)
-                    except Exception: pass
-                if _ddc_ok:
-                    _mark_ok("ddc", "DDC"); log("  [setup] ✓ DDC")
-                else:
-                    _mark_err("ddc", "DDC")
-                    log("  [setup] DDC auto-download failed.")
-                    root.after(500, lambda: messagebox.showwarning(
-                        "DDC Not Found",
-                        "DDC could not be downloaded automatically.\n\n"
-                        "To fix:\n"
-                        "1. Open your RocksmithToolkit folder\n"
-                        "2. Find ddc.exe in Third-party Apps\\ddc\\\n"
-                        "3. Copy it into the  tools\\  folder next to RS STUDIO.exe\n\n"
-                        "Then restart RS Studio."))
-            else:
-                _mark_ok("ddc", "DDC"); log("  [setup] ✓ DDC found")
-            _set_pb(85)
+            # Dynamic Difficulty is handled by the DLC Builder packer
+            # (RSDDC_Build2) at build time — no standalone ddc.exe needed, so
+            # there's nothing to download or warn about here.
 
             # --- stable-ts + faster-whisper ---
             if not _whisper_ok():
-                root.after(0, lambda: tv["whisper"].set("⬇  AI Timestamps…"))
-                _set_status("Installing stable-ts + faster-whisper…")
-                try:
-                    import sys as _sys2
-                    subprocess.run([_sys2.executable, "-m", "pip", "install", "--quiet",
+                if not _pip_py:
+                    _mark_skip("whisper", "AI Timestamps")
+                    log("  [setup] AI Timestamps: install via an external Python "
+                        "(pip install stable-ts faster-whisper).")
+                else:
+                  root.after(0, lambda: tv["whisper"].set("⬇  AI Timestamps…"))
+                  _set_status("Installing stable-ts + faster-whisper…")
+                  try:
+                    subprocess.run([_pip_py, "-m", "pip", "install", "--quiet",
                                     "stable-ts", "faster-whisper"],
                                    check=False, creationflags=CREATE_NO_WINDOW)
-                    import importlib as _il2
+                    import importlib as _il2, sys as _sys2
                     _il2.invalidate_caches()
                     for _k in list(_sys2.modules.keys()):
                         if "stable_whisper" in _k or "faster_whisper" in _k: del _sys2.modules[_k]
                     if _whisper_ok():
                         _mark_ok("whisper", "AI Timestamps"); log("  [setup] ✓ stable-ts + faster-whisper")
                     else:
-                        _mark_err("whisper", "AI Timestamps")
-                        log("  [setup] stable-ts install failed — run: pip install stable-ts faster-whisper")
-                except Exception as _we:
+                        _mark_ok("whisper", "AI Timestamps")
+                        log("  [setup] AI Timestamps installed into external Python.")
+                  except Exception as _we:
                     _mark_err("whisper", "AI Timestamps"); log(f"  [setup] stable-ts install error: {_we}")
+            _set_pb(92)
+
             _set_pb(100)
 
             _set_status("✓ All done!")
@@ -1787,6 +2033,7 @@ def run_gui():
         threading.Thread(target=_worker, daemon=True).start()
 
     _overlay_shown = [False]   # guard — only show once per session
+    _setup_ran = [False]       # guard — run the setup screen at most once
     _yt_meta_cache = [{}]      # stores last YouTube artist/title for lyrics fetch
 
     def _show_startup_overlay():
@@ -1799,8 +2046,9 @@ def run_gui():
             import importlib.util
             return (importlib.util.find_spec("stable_whisper") is not None or
                     importlib.util.find_spec("faster_whisper") is not None)
-        if not (_find_exe("yt-dlp") and _find_exe("ffmpeg") and _find_exe("ffplay")) \
-                or not _whisper_installed():
+        if not _setup_ran[0] and (
+                not (_find_exe("yt-dlp") and _find_exe("ffmpeg") and _find_exe("ffplay"))
+                or not _whisper_installed()):
             _show_setup_screen()
             return
 
@@ -2111,7 +2359,8 @@ def run_gui():
 
     def _do_fetch_lyrics():
         """Search lrclib.net for synced (LRC) or plain lyrics using artist+title."""
-        # Prefer YouTube-sourced artist/title — more reliable than GP-derived field values
+        # Prefer the UI/GP artist+title (authoritative); fall back to YouTube cache
+        # only when a field is blank, so we don't search on wrong YouTube-parsed text.
         _yt = _yt_meta_cache[0]
         artist = (vars_["artist"].get().strip() or _yt.get("artist", "")).strip()
         title  = (vars_["title"].get().strip()  or _yt.get("title",  "")).strip()
@@ -2572,7 +2821,7 @@ def run_gui():
     col_label(meta_card, "ALBUM", 2, 0); plain_field(meta_card, 3, 0, vars_["album"])
 
     styled(tk.Frame(meta_card, height=1), bg="border").grid(row=4, column=0, columnspan=4, sticky="ew", pady=(6, 10))
-    col_label(meta_card, "SONG DELAY (seconds)", 5, 0)
+    col_label(meta_card, "NOTE OFFSET (sec, ±)", 5, 0)
     col_label(meta_card, "SONG TEMPO (BPM)", 5, 1, padx=(12, 0))
     plain_field(meta_card, 6, 0, vars_["leadin"], width=9)
 
@@ -2615,22 +2864,11 @@ def run_gui():
     pe = styled(tk.Entry(cfg_f, textvariable=vars_["pitch"], font=("Segoe UI", 10), width=6, relief="flat"), bg="field", fg="fg", insertbackground="accent_hi")
     pe.pack(side="left", padx=(6, 20))
 
-    ttk.Checkbutton(cfg_f, text="Enable Dynamic Difficulty (DDC)", variable=use_ddc).pack(side="left")
-
     # --- SECTION 5: PACKER ---
     section_header(content, "Advanced Packer Settings")
     out_card = make_card(content)
     psarc_row = styled(tk.Frame(out_card), bg="card"); psarc_row.pack(fill="x", pady=(0, 6))
-    ttk.Checkbutton(psarc_row, variable=psarc_var, text="Build final .psarc with CST + Wwise 2013", style="TCheckbutton").pack(side="left")
-    pf = styled(tk.Frame(out_card), bg="card"); pf.pack(fill="x", pady=(4, 0))
-    pf.columnconfigure(1, weight=1); pf.columnconfigure(3, weight=1)
-    for ci, (lbl, vk, sd) in enumerate([("packer.exe", "packer", False), ("CST folder", "cst", True)]):
-        col = ci * 2
-        styled(tk.Label(pf, text=lbl.upper(), font=("Segoe UI", 8)), fg="muted", bg="card").grid(row=0, column=col, sticky="w", padx=(0 if col == 0 else 16, 0), pady=(0, 2))
-        ef = styled(tk.Frame(pf, highlightthickness=1), bg="field", highlightbackground="border")
-        ef.grid(row=1, column=col, sticky="ew", pady=(0, 4), padx=(0 if col == 0 else 16, 0), ipady=1)
-        styled(tk.Entry(ef, textvariable=vars_[vk], relief="flat", font=("Segoe UI", 10), bd=4, highlightthickness=0), bg="field", fg="fg", insertbackground="accent_hi").pack(side="left", fill="x", expand=True)
-        ttk.Button(ef, text="⋯", command=browse(vars_[vk], [] if sd else [("packer.exe", "packer.exe"), ("All", "*.*")], save_dir=sd), style="Inline.TButton").pack(side="right", padx=2)
+    ttk.Checkbutton(psarc_row, variable=psarc_var, text="Build final .psarc (via RSDDC_Build2)", style="TCheckbutton").pack(side="left")
 
     # ══════════════════════════════════════════════════════════════════════
     # PAGE: AUDIO EDITOR (formerly Slopsmith)
@@ -2987,7 +3225,7 @@ def run_gui():
         if _wf_state["tick_id"] is not None:
             try: root.after_cancel(_wf_state["tick_id"])
             except Exception: pass
-        _wf_state["tick_id"] = root.after(40, _wf_tick)
+        _wf_state["tick_id"] = root.after(16, _wf_tick)   # ~60 fps
         def _watch():
             proc.wait()
             _wf_state["playing"] = False; _wf_state["proc"] = None
@@ -3031,7 +3269,7 @@ def run_gui():
         except Exception: pass
         _wf_redraw()
         if _wf_state["playing"]:
-            _wf_state["tick_id"] = root.after(40, _wf_tick)
+            _wf_state["tick_id"] = root.after(16, _wf_tick)   # ~60 fps
         else:
             _wf_state["tick_id"] = None
 
@@ -3846,6 +4084,14 @@ def run_gui():
         "loading":      False,
         "track_leadins": {},        # {ti: float} per-track leadin overrides
         "vol":           70,        # ffplay volume 0-100
+        "vocal_mode":    False,     # True when the 🎤 Vocals entry is selected
+        "lyric_blocks":  [],        # [(x0,x1,y0,y1,line_index)] hit-test boxes
+        "lrc_dur":       {},        # {line_index: display duration override}
+        "track_map":     {},        # dropdown label -> gp track index (None=Vocals)
+        "_vocals_label": "",        # the Vocals dropdown entry text
+        "drag_li":       None,      # lyric line index being dragged
+        "drag_mode":     None,      # "move" or "dur"
+        "drag_dx":       0,         # grab offset within the block
     }
 
     def _sv_get_leadin(ti=None):
@@ -3878,49 +4124,21 @@ def run_gui():
     sv_track_cb = ttk.Combobox(sv_ctrl, textvariable=sv_track_var, state="readonly", width=32, font=("Segoe UI", 9))
     sv_track_cb.pack(side="left", padx=(4, 8))
 
-    # per-track leadin display (inline with track selector)
+    # Leadin + BPM-scale used to live up here; they are now in the lower
+    # controls (Track Offset row + BPM scale row) so the top bar stays compact
+    # and the tab / fretboard views get more room. sv_leadin_var is still the
+    # shared leadin display variable, shown in the Track Offset row below.
     sv_leadin_var = tk.StringVar(value="5.00")
-    styled(tk.Label(sv_ctrl, text="Leadin:", font=("Segoe UI", 9)), fg="muted", bg="surface").pack(side="left", padx=(4, 2))
-    styled(tk.Label(sv_ctrl, textvariable=sv_leadin_var,
-                    font=("Segoe UI Semibold", 10), width=6),
-           fg="accent", bg="surface").pack(side="left")
-    styled(tk.Label(sv_ctrl, text="s  (min 5.0)", font=("Segoe UI", 8)), fg="dim", bg="surface").pack(side="left", padx=(0, 16))
-
-    styled(tk.Label(sv_ctrl, text="BPM scale:", font=("Segoe UI", 9)), fg="muted", bg="surface").pack(side="left")
-    sv_bpm_entry = styled(tk.Entry(sv_ctrl, textvariable=vars_["bpm_factor"],
-                                   width=7, relief="flat", font=("Segoe UI", 10),
-                                   bd=4, highlightthickness=0),
-                          bg="field", fg="fg", insertbackground="accent_hi")
-    sv_bpm_entry.pack(side="left", padx=(4, 4))
-
-    sv_bpm_lbl = styled(tk.Label(sv_ctrl, text="×1.000  (drag slider to fine-tune)", font=("Segoe UI", 8)),
-                        fg="dim", bg="surface")
-    sv_bpm_lbl.pack(side="left", padx=(2, 10))
-
-    sv_bpm_scale = tk.Scale(sv_ctrl, from_=0.850, to=1.150, resolution=0.001,
-                             orient="horizontal", length=200,
-                             bg=COL["surface"], fg=COL["fg"],
-                             troughcolor=COL["card"], highlightthickness=0,
-                             showvalue=False, command=lambda v: vars_["bpm_factor"].set(f"{float(v):.3f}"))
-    sv_bpm_scale.set(1.0)
-    sv_bpm_scale.pack(side="left")
-
-    def _sv_bpm_entry_changed(*_):
-        try:
-            v = float(vars_["bpm_factor"].get())
-            sv_bpm_scale.set(v)
-            sv_bpm_lbl.configure(text=f"×{v:.3f}")
-            _sv_reparse_notes()
-        except ValueError:
-            pass
-    vars_["bpm_factor"].trace_add("write", _sv_bpm_entry_changed)
 
     # ── lyrics strip ──────────────────────────────────────────────────────
+    # NOTE: the full-line label used to live here, but it duplicated the karaoke
+    # word-strip below. We keep the StringVar (other code reads/sets it) but no
+    # longer show a second line — the karaoke strip is the single lyric display.
     sv_lyric_var = tk.StringVar(value="")
-    sv_lyric_lbl = styled(tk.Label(sync_page, textvariable=sv_lyric_var,
-                                   font=("Segoe UI Semibold", 11), wraplength=1200),
-                          fg="accent", bg="surface")
-    sv_lyric_lbl.pack(anchor="center", pady=(0, 4))
+
+    # ── karaoke word strip (highlights the current word as the song plays) ──
+    sv_kara = tk.Canvas(sync_page, height=34, bg=COL["surface"], highlightthickness=0)
+    sv_kara.pack(fill="x", padx=28, pady=(0, 2))
 
     # ── scrubber / timeline ───────────────────────────────────────────────
     sv_scrub = tk.Canvas(sync_page, height=44, bg=COL["card2"], highlightthickness=0, cursor="hand2")
@@ -4007,13 +4225,29 @@ def run_gui():
     sv_scrub.bind("<Configure>",  lambda e: _sv_draw_scrubber())
 
     # ── tab canvas ────────────────────────────────────────────────────────
-    TAB_H    = 175
+    TAB_H    = 260
     TAB_PAD  = 22   # top/bottom padding inside canvas
     VIEW_SEC = 14.0  # seconds visible
     AHEAD    = 0.3   # fraction of canvas width = playhead position
 
+    # Per-string colours/names indexed from the LOWEST string (index 0 = low E),
+    # matching gp2rs' string indexing (tuning is stored low->high). This is the
+    # Rocksmith colour scheme: E red, A yellow, D blue, G orange, B green, e purple.
+    # Bass (4 strings) therefore uses only E/A/D/G — no purple/green.
+    RS_STR_COLS  = ["#e0432a", "#e6c619", "#3a7bff", "#e07b1a", "#2fbf4f", "#b05cff"]
+    RS_STR_NAMES = ["E", "A", "D", "G", "B", "e"]
+
+    # The tab/timeline view absorbs all leftover vertical space (expand=True);
+    # the fretboard panel below it keeps a fixed height so it always renders in
+    # full and never gets squeezed/cut off when the window is short.
     sv_tab = tk.Canvas(sync_page, height=TAB_H, bg="#070c15", highlightthickness=0, cursor="crosshair")
-    sv_tab.pack(fill="x", padx=28, pady=(0, 6))
+    sv_tab.pack(fill="both", expand=True, padx=28, pady=(0, 6))
+
+    # ── fretboard panel (lights up the notes sounding at the playhead) ──────
+    FB_FRETS = 24  # real guitars commonly go past 18; 24 covers virtually all CDLC
+    FB_HEIGHT = 170
+    sv_fret = tk.Canvas(sync_page, height=FB_HEIGHT, bg="#0a0f1a", highlightthickness=0)
+    sv_fret.pack(fill="x", expand=False, padx=28, pady=(0, 6))
 
     def _sv_string_ys(canvas_h=None, n=None):
         h = canvas_h or sv_tab.winfo_height() or TAB_H
@@ -4023,8 +4257,221 @@ def run_gui():
         gap  = span / max(1, n - 1)
         return [pad + i * gap for i in range(n)]  # index 0 = high e (top)
 
+    def _sv_draw_fretboard():
+        """Fretboard view: light up the notes sounding around the playhead."""
+        try:
+            sv_fret.delete("all")
+        except Exception:
+            return
+        cw = sv_fret.winfo_width() or 900
+        ch = sv_fret.winfo_height() or 120
+        n  = _sv["n_strings"] or 6
+        pad_l, pad_r, pad_t, pad_b = 26, 10, 12, 16
+        nfr = FB_FRETS
+
+        # Real fretboards taper: each fret is closer to the next as you move up
+        # the neck (12th-root-of-2 scale, same ratio every luthier uses). Frets
+        # 1-12 take up half the board and 13+ get visibly skinnier, matching an
+        # actual guitar instead of evenly-spaced boxes.
+        _rel = [1.0 - 2.0 ** (-f / 12.0) for f in range(nfr + 1)]
+        _norm = _rel[-1] or 1.0
+        edges = [pad_l + (cw - pad_l - pad_r) * (r / _norm) for r in _rel]
+
+        def _cell_x(f):  # center x of the cell just behind fret wire f (f=1..nfr)
+            return (edges[f - 1] + edges[f]) / 2.0
+
+        rows = n
+        rh  = (ch - pad_t - pad_b) / max(1, rows - 1)
+        ys  = [pad_t + i * rh for i in range(rows)]
+        # row i = string index i (low E first); matches note s -> ys[s] mapping.
+        labels = [RS_STR_NAMES[i] if i < 6 else str(i) for i in range(n)]
+        # inlays (standard single-dot frets + double dots at the octave marks)
+        for f in (3, 5, 7, 9, 12, 15, 17, 19, 21, 24):
+            if f <= nfr:
+                ix = _cell_x(f)
+                dots = [0] if f not in (12, 24) else [-7, 7]
+                for dy in dots:
+                    cy = (pad_t + ch - pad_b) // 2 + dy
+                    sv_fret.create_oval(ix - 3, cy - 3, ix + 3, cy + 3,
+                                        fill="#16203a", outline="")
+        # fret wires + numbers
+        for f in range(nfr + 1):
+            x = edges[f]
+            sv_fret.create_line(x, pad_t - 4, x, ch - pad_b + 4,
+                                fill="#243150", width=3 if f == 0 else 1)
+            if f > 0:
+                sv_fret.create_text(_cell_x(f), ch - 3, text=str(f),
+                                    fill="#3a4a66", font=("Segoe UI", 7), anchor="s")
+        # strings + names
+        for i, y in enumerate(ys):
+            sv_fret.create_line(pad_l, y, cw - pad_r, y, fill="#2a3550", width=1)
+            sv_fret.create_text(10, y, text=labels[i], fill="#556688", font=("Courier", 8))
+        # gather the notes sounding right now (lights up as dots)
+        cur = _sv_elapsed()
+        WIN = 0.13
+        active = []   # (string_index, fret)
+        for nd in (_sv.get("notes") or []):
+            t = nd["t"]; sus = nd.get("sus", 0.0) or 0.0
+            if not (t - WIN <= cur <= t + max(sus, WIN)):
+                continue
+            s = max(0, min(nd["s"], n - 1))
+            fret = nd["fret"]
+            if fret < 0:
+                continue
+            active.append((s, min(fret, nfr)))
+
+        # ── Fret-Hand Position: anchor box on the held hand shape ───────────
+        # A chord/riff is usually fretted as one static hand shape and picked
+        # note-by-note, not re-gripped on every single note. Using the same
+        # tight WIN as the lit-up dots made the box re-anchor on every note —
+        # it looked like one finger darting around instead of a held shape.
+        # So the box itself looks at a wider window (current phrase, not just
+        # the instant) while the dots above still only light up on WIN.
+        FHP_WIN = 0.6
+        fhp_fretted = []
+        for nd in (_sv.get("notes") or []):
+            t = nd["t"]; sus = nd.get("sus", 0.0) or 0.0
+            if not (t - FHP_WIN <= cur <= t + max(sus, FHP_WIN)):
+                continue
+            fret = nd["fret"]
+            if fret > 0:
+                fhp_fretted.append(min(fret, nfr))
+        # If the wider window spans too much (a scale run, not a chord), fall
+        # back to just what's sounding right now so the box doesn't balloon.
+        if fhp_fretted and (max(fhp_fretted) - min(fhp_fretted)) <= 5:
+            fretted = fhp_fretted
+        else:
+            fretted = [f for _s, f in active if f > 0]
+        anchor = None
+        if fretted:
+            lo, hi = min(fretted), max(fretted)
+            anchor = lo if (hi - lo) <= 3 else max(1, hi - 3)
+            bx0 = edges[anchor - 1]
+            bx1 = edges[min(nfr, anchor + 3)]
+            sv_fret.create_rectangle(bx0, pad_t - 6, bx1, ch - pad_b + 6,
+                                     fill=COL["accent"], outline="", stipple="gray12")
+            sv_fret.create_rectangle(bx0, pad_t - 6, bx1, ch - pad_b + 6,
+                                     outline=COL["accent"], width=2)
+            sv_fret.create_text(bx0 + 4, pad_t - 5, text=f"FHP {anchor}",
+                                anchor="sw", fill=COL["accent_hi"],
+                                font=("Segoe UI Semibold", 7))
+
+        # ── draw notes with finger numbers (1-4; 0 = open string) ───────────
+        for (s, fret) in active:
+            y = ys[s]
+            cx = (pad_l - 9) if fret == 0 else _cell_x(fret)
+            scol = RS_STR_COLS[s] if s < 6 else COL["accent"]
+            r = 9
+            sv_fret.create_oval(cx - r, y - r, cx + r, y + r, fill=scol, outline="#ffffff", width=1)
+            sv_fret.create_text(cx, y, text=str(fret), fill="#06121f",
+                                font=("Segoe UI Semibold", 8))
+            # finger badge: 0 for open, else position within the FHP box
+            if fret == 0:
+                fng = "0"
+            elif anchor is not None:
+                fng = str(max(1, min(4, fret - anchor + 1)))
+            else:
+                fng = ""
+            if fng:
+                fy = max(pad_t - 2, y - r - 6)
+                sv_fret.create_text(cx, fy, text=fng, fill="#ffffff",
+                                    font=("Segoe UI Semibold", 8))
+
+    def _sv_draw_kara():
+        """Karaoke strip: draw the current lyric line, highlighting the word being
+        sung now. Word timing is the line's span split evenly, capped at 0.5s so
+        words don't smear across long gaps to the next line."""
+        try:
+            sv_kara.delete("all")
+        except Exception:
+            return
+        cw = sv_kara.winfo_width() or 900
+        ch = sv_kara.winfo_height() or 34
+        lrc = _sv.get("lrc") or []
+        if not lrc:
+            return
+        cur = _sv_elapsed()
+        idx = -1
+        for i, (t, _x) in enumerate(lrc):
+            if t <= cur:
+                idx = i
+            else:
+                break
+        if idx < 0:
+            sv_kara.create_text(cw // 2, ch // 2, text=lrc[0][1][:80],
+                                fill="#5a6a85", font=("Segoe UI", 12))
+            return
+        t_line, text = lrc[idx]
+        t_next = lrc[idx + 1][0] if idx + 1 < len(lrc) else t_line + 4.0
+        toks = text.split()
+        if not toks:
+            return
+        span = max(0.4, t_next - t_line)
+        step = min(span / len(toks), 0.5)
+        active = len(toks) - 1
+        for j in range(len(toks)):
+            if cur < t_line + (j + 1) * step:
+                active = j
+                break
+        fnt = ("Segoe UI Semibold", 13)
+        widths = []
+        for tok in toks:
+            tid = sv_kara.create_text(0, -50, text=tok, font=fnt, anchor="w")
+            bb = sv_kara.bbox(tid)
+            widths.append((bb[2] - bb[0]) if bb else 8 * len(tok))
+            sv_kara.delete(tid)
+        gap = 12
+        total = sum(widths) + gap * (len(toks) - 1)
+        x = max(10, (cw - total) // 2)
+        for j, tok in enumerate(toks):
+            col = (COL["accent"] if j == active
+                   else "#9fb6e0" if j < active else "#6b7a95")
+            sv_kara.create_text(x, ch // 2, text=tok, anchor="w", fill=col, font=fnt)
+            x += widths[j] + gap
+
+    def _sv_draw_lyric_blocks(cw, ch, px, cur, pps):
+        """Vocals mode: draw each lyric line as a draggable block on the timeline."""
+        lrc = _sv.get("lrc") or []
+        _sv["lyric_blocks"] = []
+        if not lrc:
+            sv_tab.create_text(cw // 2, ch // 2,
+                               text="No lyrics loaded — fetch lyrics or set a .lrc on the Main tab",
+                               fill="#445566", font=("Segoe UI", 10))
+            return
+        y0, y1 = 16, ch - 16
+        dur_map = _sv.get("lrc_dur") or {}
+        for li, (t, txt) in enumerate(lrc):
+            nt = lrc[li + 1][0] if li + 1 < len(lrc) else t + 3.0
+            d = dur_map.get(li)
+            if d is None:
+                d = min(max(0.6, nt - t), 4.0)
+            x0 = px + (t - cur) * pps
+            x1 = max(x0 + 8, px + (t + d - cur) * pps)
+            if x1 < -60 or x0 > cw + 60:
+                _sv["lyric_blocks"].append((x0, x1, y0, y1, li))
+                continue
+            played = t <= cur
+            col = COL["accent"] if not played else "#3a4a6a"
+            sv_tab.create_rectangle(x0, y0, x1, y1,
+                                    fill="#10243f" if not played else "#0c1526",
+                                    outline=col, width=2)
+            # right-edge resize handle (drag to stretch/shrink where the line ends)
+            hw = 7
+            sv_tab.create_rectangle(x1 - hw, y0, x1, y1, fill=col, outline="")
+            gy = (y0 + y1) // 2
+            for _dy in (-4, 0, 4):                       # grip lines so it reads as draggable
+                sv_tab.create_line(x1 - hw + 3, gy + _dy, x1 - 2, gy + _dy,
+                                   fill="#0c1526", width=1)
+            sv_tab.create_text(x0 + 8, (y0 + y1) // 2, text=txt[:64], anchor="w",
+                               fill="#dbe6ff" if not played else "#7a8aa5",
+                               font=("Segoe UI", 10))
+            _sv["lyric_blocks"].append((x0, x1, y0, y1, li))
+
     def _sv_draw_tab():
         sv_tab.delete("all")
+        _sv["lyric_blocks"] = []
+        _sv_draw_kara()
+        _sv_draw_fretboard()
         cw = sv_tab.winfo_width() or 900
         ch = sv_tab.winfo_height() or TAB_H
         n  = _sv["n_strings"]
@@ -4035,16 +4482,14 @@ def run_gui():
         t_left  = cur - px / pps
         t_right = cur + (cw - px) / pps
 
-        # String labels (e B G D A E  etc.)
-        STD_NAMES = ["e","B","G","D","A","E"]
-        str_labels = STD_NAMES[:n] if n <= 6 else [str(i) for i in range(n)]
-
-        # Draw string lines
+        # String labels + colours, indexed from the lowest string (row i = string
+        # index i = low E first). Bass shows E/A/D/G only (no purple/green).
+        str_labels = [RS_STR_NAMES[i] if i < 6 else str(i) for i in range(n)]
         for i, y in enumerate(ys):
-            lw = 1 if i > 0 else 1
-            sv_tab.create_line(0, y, cw, y, fill="#2a2a44", width=lw, tags="strings")
-            sv_tab.create_text(10, y, text=str_labels[i], fill="#445566",
-                               font=("Courier", 8), anchor="center", tags="strings")
+            scol = RS_STR_COLS[i] if i < 6 else "#2a2a44"
+            sv_tab.create_line(0, y, cw, y, fill="#23233a", width=1, tags="strings")
+            sv_tab.create_text(10, y, text=str_labels[i], fill=scol,
+                               font=("Courier", 8, "bold"), anchor="center", tags="strings")
 
         # Song-start line (right edge of leadin zone)
         ld = _sv_get_leadin()
@@ -4054,9 +4499,25 @@ def run_gui():
             sv_tab.create_text(ld_x + 3, 8, text="song start", anchor="w",
                                fill="#7a5010", font=("Segoe UI", 8))
 
+        # Song-end line: where the AUDIO ends. Notes drawn to the right of this
+        # run past the end of the song (tempo/length mismatch — use Fit-to-audio
+        # or BPM scale to correct).
+        _adur = _sv.get("audio_dur", 0.0) or 0.0
+        if _adur > 0:
+            end_x = px + (_adur - cur) * pps
+            if 0 < end_x < cw:
+                sv_tab.create_line(end_x, 0, end_x, ch, fill="#7a1530", width=2, dash=(3, 3))
+                sv_tab.create_text(end_x - 3, 8, text="song end", anchor="e",
+                                   fill="#d24a63", font=("Segoe UI", 8))
+
         # Playhead
         sv_tab.create_line(px, 4, px, ch-4, fill=COL["accent"], width=2)
         sv_tab.create_rectangle(px-1, 0, px+1, ch, fill=COL["accent"], outline="")
+
+        # Vocals mode: draw lyric blocks instead of guitar notes.
+        if _sv.get("vocal_mode"):
+            _sv_draw_lyric_blocks(cw, ch, px, cur, pps)
+            return
 
         # Draw notes
         notes = _sv["notes"]
@@ -4065,19 +4526,49 @@ def run_gui():
                                fill="#445566", font=("Segoe UI", 10))
             return
 
-        for (t, s, fret) in notes:
-            if t < t_left - 0.5 or t > t_right + 0.5:
+        # measure bar lines
+        for _bt in _sv.get("bar_times", []):
+            bt = _bt[0] if isinstance(_bt, (list, tuple)) else _bt
+            if t_left <= bt <= t_right:
+                bx = px + (bt - cur) * pps
+                sv_tab.create_line(bx, 0, bx, ch, fill="#1c2740", width=1)
+
+        for nd in notes:
+            t = nd["t"]
+            if t < t_left - 0.6 or t > t_right + 0.6:
                 continue
-            s = max(0, min(s, n - 1))  # clamp instead of skip
+            s = max(0, min(nd["s"], n - 1))  # clamp instead of skip
             x = px + (t - cur) * pps
             y = ys[s]
             played = t < cur
-            fg_col = "#3a3a5a" if played else COL["accent"]
+            scol = RS_STR_COLS[s] if s < 6 else COL["accent"]
+            fg_col = "#3a3a5a" if played else scol
+            # sustain bar
+            sus = nd.get("sus", 0.0) or 0.0
+            if sus > 0.05:
+                x2 = px + (t + sus - cur) * pps
+                sv_tab.create_line(x + 10, y, max(x + 10, x2), y, fill=fg_col, width=3)
+            # note box + fret
             sv_tab.create_rectangle(x-10, y-9, x+10, y+9,
                                     fill="#0a0f20" if played else "#0d1830",
                                     outline=fg_col if not played else "#2a2a44", width=1)
-            sv_tab.create_text(x, y, text=str(fret),
+            sv_tab.create_text(x, y, text=str(nd["fret"]),
                                fill=fg_col, font=("Courier", 9, "bold"))
+            # technique glyphs
+            if nd.get("palm"):
+                sv_tab.create_text(x, y-14, text="✕", fill="#8aa0c0", font=("Segoe UI", 7, "bold"))
+            if nd.get("harm"):
+                sv_tab.create_text(x-12, y-10, text="◇", fill="#8aa0c0", font=("Segoe UI", 8))
+            if nd.get("hammer"):
+                sv_tab.create_text(x, y+15, text="H", fill="#9fb6e0", font=("Segoe UI", 7, "bold"))
+            if nd.get("bend"):
+                sv_tab.create_text(x+13, y-9, text="↑", fill=fg_col, font=("Segoe UI", 9, "bold"))
+            if nd.get("slide"):
+                sv_tab.create_line(x+8, y+7, x+17, y-7, fill=fg_col, width=2)
+            if nd.get("trem"):
+                sv_tab.create_text(x, y+15, text="≈", fill="#9fb6e0", font=("Segoe UI", 8))
+            if nd.get("vib"):
+                sv_tab.create_text(x+13, y+8, text="∿", fill="#9fb6e0", font=("Segoe UI", 8))
 
     def _sv_update_lyric():
         if not _sv["lrc"]:
@@ -4104,18 +4595,56 @@ def run_gui():
                 except Exception: pass
                 _sv_draw_scrubber()
                 return
-            _sv["after_id"] = root.after(80, _sv_tick)
+            _sv["after_id"] = root.after(16, _sv_tick)   # ~60 fps
 
     # ── canvas events ─────────────────────────────────────────────────────
     _tab_drag = {"was_playing": False, "anchor_x": 0, "anchor_t": 0.0}
 
     def _sv_tab_press(event):
+        if _sv.get("vocal_mode"):
+            _sv["drag_li"] = None
+            # Freeze playback while dragging so the moving playhead doesn't fight
+            # the cursor (this was the "buggy drag"). We pin an anchor at the grab
+            # point and move relative to it, independent of elapsed time.
+            _sv["drag_was_playing"] = _sv["t0"] is not None
+            if _sv["drag_was_playing"]:
+                _sv_stop()
+            for (x0, x1, y0, y1, li) in _sv.get("lyric_blocks", []):
+                if x0 - 6 <= event.x <= x1 + 8 and y0 <= event.y <= y1:
+                    _sv["drag_li"] = li
+                    _sv["drag_mode"] = "dur" if (x1 - event.x) <= 12 else "move"
+                    _sv["drag_anchor_x"] = event.x
+                    _sv["drag_orig_t"] = _sv["lrc"][li][0]
+                    _sv["drag_orig_d"] = (_sv.get("lrc_dur", {}) or {}).get(li)
+                    break
+            return
         _tab_drag["was_playing"] = _sv["t0"] is not None
         _tab_drag["anchor_x"] = event.x
         _tab_drag["anchor_t"] = _sv_elapsed()
         if _tab_drag["was_playing"]: _sv_stop()
 
     def _sv_tab_move(event):
+        if _sv.get("vocal_mode"):
+            li = _sv.get("drag_li")
+            if li is None:
+                return
+            cw  = max(sv_tab.winfo_width(), 1)
+            pps = cw / VIEW_SEC
+            lrc = _sv["lrc"]
+            # Move relative to the pinned grab anchor — robust whether or not the
+            # song is playing, and never snaps to the playhead.
+            dt = (event.x - _sv.get("drag_anchor_x", event.x)) / pps
+            if _sv.get("drag_mode") == "dur":
+                base_d = _sv.get("drag_orig_d")
+                if base_d is None:           # no explicit duration yet → default
+                    nt = lrc[li + 1][0] if li + 1 < len(lrc) else lrc[li][0] + 3.0
+                    base_d = min(max(0.6, nt - lrc[li][0]), 4.0)
+                _sv.setdefault("lrc_dur", {})[li] = max(0.3, round(base_d + dt, 3))
+            else:
+                new_t = max(0.0, round(_sv.get("drag_orig_t", lrc[li][0]) + dt, 3))
+                lrc[li] = (new_t, lrc[li][1])
+            _sv_draw_tab()
+            return
         dur = _sv["audio_dur"]
         if dur <= 0: return
         cw  = max(sv_tab.winfo_width(), 1)
@@ -4127,6 +4656,12 @@ def run_gui():
         _sv_draw_tab()
 
     def _sv_tab_release(event):
+        if _sv.get("vocal_mode"):
+            if _sv.get("drag_li") is not None:
+                _sv_tab_move(event)
+                _sv["drag_li"] = None
+                _sv_write_lrc()
+            return
         _sv_tab_move(event)
         if _tab_drag["was_playing"]: root.after(60, _sv_play)
 
@@ -4143,23 +4678,35 @@ def run_gui():
         ld    = _sv_get_leadin(ti)
         bfs   = float(vars_["bpm_factor"].get() or 1.0)
         try:
-            beats, bar_times = gp.track_beats(ti, ld, bpm_scale=bfs)
+            # Use the full converter (same path as the build) so we get technique
+            # flags + sustain, not just bare (time,string,fret).
+            notes_rs, beats, bar_times = gp2rs.convert_track(gp, ti, ld, bpm_scale=bfs)
             notes = []
-            tie_count = 0
-            for b in beats:
-                for n in b.notes:
-                    if not n.tie_dest:
-                        notes.append((b.start, n.string, n.fret))
-                    else:
-                        tie_count += 1
+            for nn in notes_rs:
+                notes.append({
+                    "t": getattr(nn, "time", 0.0), "s": nn.string, "fret": nn.fret,
+                    "sus": getattr(nn, "sustain", 0.0) or 0.0,
+                    "palm": bool(getattr(nn, "palm", False) or getattr(nn, "mute", False)),
+                    "hammer": bool(getattr(nn, "hammer", False) or getattr(nn, "pull", False)),
+                    "bend": (getattr(nn, "max_bend", 0) or 0) > 0,
+                    "vib": bool(getattr(nn, "vibrato", False)),
+                    "slide": (getattr(nn, "slide_to", -1) or -1) > 0
+                             or (getattr(nn, "uslide_to", -1) or -1) > 0,
+                    "trem": bool(getattr(nn, "tremolo", False)),
+                    "harm": bool(getattr(nn, "harmonic", False)),
+                })
             _sv["notes"]     = notes
             _sv["bar_times"] = bar_times
             n_str = _sv["n_strings"]
-            out_of_range = sum(1 for (_, s, _) in notes if s < 0 or s >= n_str)
-            _sv_set_status(
-                f"Track {ti}: {len(beats)} beats · {len(notes)} notes "
-                f"({tie_count} ties skipped · {out_of_range} out-of-range) · "
-                f"n_strings={n_str} · leadin={ld:.2f}s")
+            out_of_range = sum(1 for nd in notes if nd["s"] < 0 or nd["s"] >= n_str)
+            # Routine parse info goes to the log only — the status bar under the
+            # tab view is reserved for things you actually need to act on.
+            log(f"  [sync] Track {ti}: {len(notes)} notes "
+                f"({out_of_range} out-of-range) · n_strings={n_str} · leadin={ld:.2f}s")
+            if out_of_range:
+                _sv_set_status(f"⚠ {out_of_range} note(s) out of string range on this track.")
+            else:
+                _sv_set_status("")
             _sv_draw_tab()
         except Exception as ex:
             import traceback as _tb
@@ -4215,6 +4762,21 @@ def run_gui():
                             for i, txt in enumerate(plain):
                                 lrc.append((leadin + i * step, txt))
                     except Exception: pass
+                # If no external lyrics file, use lyrics embedded in the GP
+                # (Official tabs) — already beat-aligned, no fetch needed.
+                if not lrc:
+                    try:
+                        _ld_emb = float(vars_["leadin"].get() or 5)
+                    except Exception:
+                        _ld_emb = 5.0
+                    try:
+                        _emb_lines = gp2rs.gp_lyric_lines(gp, _ld_emb)
+                        if _emb_lines:
+                            lrc = _emb_lines
+                            log(f"  [sync] using {len(lrc)} lyric lines embedded "
+                                f"in the GP")
+                    except Exception:
+                        pass
                 _sv["lrc"] = lrc
                 # Auto-select: prefer track named "lead", else first guitar/bass
                 lead_ti = None; first_guitar_ti = None
@@ -4229,15 +4791,28 @@ def run_gui():
                 _sv["track_idx"] = best_ti
                 _sv["n_strings"] = len(gp.tuning(best_ti))
                 # Populate track dropdown — show kind tag after name
-                def _tagged(i, nm):
+                # Only guitar/bass tracks, plus a Vocals entry for lyric dragging.
+                _VOCALS_LABEL = "🎤 Vocals  (drag lyric lines)"
+                display_names = []
+                tmap = {}
+                for i, nm in enumerate(track_names):
                     k = gp.track_kind(i)
-                    tag = {"guitar": " [guitar]", "bass": " [bass]"}.get(k, "")
-                    return nm + tag
-                display_names = [_tagged(i, nm) for i, nm in enumerate(track_names)]
+                    if k not in ("guitar", "bass"):
+                        continue
+                    label = nm + {"guitar": " [guitar]", "bass": " [bass]"}.get(k, "")
+                    if label in tmap:            # de-dupe identical track names
+                        label = f"{label} ({i})"
+                    display_names.append(label)
+                    tmap[label] = i
+                display_names.append(_VOCALS_LABEL)
+                tmap[_VOCALS_LABEL] = None
+                _sv["track_map"] = tmap
+                _sv["_vocals_label"] = _VOCALS_LABEL
                 _sv["_display_names"] = display_names
+                cur_label = next((lb for lb, gi in tmap.items() if gi == best_ti),
+                                 display_names[0] if display_names else "")
                 root.after(0, lambda: sv_track_cb.configure(values=display_names))
-                if display_names:
-                    root.after(0, lambda: sv_track_var.set(display_names[_sv["track_idx"]]))
+                root.after(0, lambda lb=cur_label: sv_track_var.set(lb))
                 _ld_init = _sv_get_leadin(best_ti)
                 root.after(0, lambda: sv_leadin_var.set(f"{_ld_init:.2f}"))
                 root.after(0, _sv_reparse_notes)
@@ -4254,23 +4829,31 @@ def run_gui():
         threading.Thread(target=_worker, daemon=True).start()
 
     def _sv_on_track_change(event=None):
-        names = list(sv_track_cb["values"])
-        sel   = sv_track_var.get()
-        if sel in names:
-            ti = names.index(sel)
-            _sv["track_idx"] = ti
-            gp = _sv.get("gp")
-            if gp:
-                _sv["n_strings"] = len(gp.tuning(ti))
-            sv_leadin_var.set(f"{_sv_get_leadin(ti):.2f}")
-            _sv_reparse_notes()
+        sel = sv_track_var.get()
+        tmap = _sv.get("track_map") or {}
+        if sel == _sv.get("_vocals_label"):
+            _sv["vocal_mode"] = True
+            _sv_set_status("Vocals mode — drag each lyric line to where it's sung; "
+                           "drag a line's right edge to stretch its duration.")
+            _sv_draw_tab()
+            return
+        _sv["vocal_mode"] = False
+        gi = tmap.get(sel)
+        if gi is None:
+            _sv_draw_tab(); return
+        _sv["track_idx"] = gi
+        gp = _sv.get("gp")
+        if gp:
+            _sv["n_strings"] = len(gp.tuning(gi))
+        sv_leadin_var.set(f"{_sv_get_leadin(gi):.2f}")
+        _sv_reparse_notes()
     sv_track_cb.bind("<<ComboboxSelected>>", _sv_on_track_change)
 
     # ── per-track leadin nudge ────────────────────────────────────────────
     sv_nudge_row = styled(tk.Frame(sync_page), bg="surface")
     sv_nudge_row.pack(anchor="center", pady=(2, 8))
 
-    styled(tk.Label(sv_nudge_row, text="Track leadin:", font=("Segoe UI", 9)),
+    styled(tk.Label(sv_nudge_row, text="Track Offset:", font=("Segoe UI", 9)),
            fg="muted", bg="surface").pack(side="left", padx=(0, 8))
 
     for (_d, _lbl) in [(-0.5,"◀ 0.5s"), (-0.1,"◀ 0.1s"), (-0.05,"◀ 0.05s")]:
@@ -4299,6 +4882,62 @@ def run_gui():
               relief="flat", bd=0, padx=10, pady=4, cursor="hand2",
               bg=COL["accent"], fg="#ffffff", activebackground=COL["accent_hi"],
               command=_sv_apply_leadin).pack(side="left", padx=(16, 2))
+
+    # ── BPM scale (timing stretch) — relocated here from the top bar ───────
+    sv_bpm_row = styled(tk.Frame(sync_page), bg="surface")
+    sv_bpm_row.pack(anchor="center", pady=(0, 6))
+    styled(tk.Label(sv_bpm_row, text="BPM scale:", font=("Segoe UI", 9)),
+           fg="muted", bg="surface").pack(side="left")
+    sv_bpm_entry = styled(tk.Entry(sv_bpm_row, textvariable=vars_["bpm_factor"],
+                                   width=7, relief="flat", font=("Segoe UI", 10),
+                                   bd=4, highlightthickness=0),
+                          bg="field", fg="fg", insertbackground="accent_hi")
+    sv_bpm_entry.pack(side="left", padx=(4, 4))
+    sv_bpm_lbl = styled(tk.Label(sv_bpm_row, text="×1.000  (1.0 = no change)",
+                                 font=("Segoe UI", 8)), fg="dim", bg="surface")
+    sv_bpm_lbl.pack(side="left", padx=(2, 10))
+    sv_bpm_scale = tk.Scale(sv_bpm_row, from_=0.850, to=1.150, resolution=0.001,
+                            orient="horizontal", length=220,
+                            bg=COL["surface"], fg=COL["fg"],
+                            troughcolor=COL["card"], highlightthickness=0,
+                            showvalue=False,
+                            command=lambda v: vars_["bpm_factor"].set(f"{float(v):.3f}"))
+    sv_bpm_scale.set(1.0)
+    sv_bpm_scale.pack(side="left")
+
+    def _sv_fit_bpm():
+        """Auto-set BPM scale so the LAST note lands near the audio end (≈2s tail).
+        Fixes charts whose notes run past the end of the song."""
+        adur = _sv.get("audio_dur", 0.0) or 0.0
+        notes = _sv.get("notes") or []
+        if adur <= 1 or not notes:
+            return _sv_set_status("Load GP + audio first (Reload), then Fit.")
+        ti = _sv["track_idx"]; ld = _sv_get_leadin(ti)
+        last = max((nd["t"] + (nd.get("sus", 0.0) or 0.0)) for nd in notes)
+        span_now = last - ld
+        span_target = max(5.0, adur - 2.0) - ld
+        if span_now <= 0 or span_target <= 0:
+            return _sv_set_status("Not enough chart to fit.")
+        f_old = float(vars_["bpm_factor"].get() or 1.0)
+        f_new = max(0.5, min(2.0, round(f_old * (span_now / span_target), 3)))
+        vars_["bpm_factor"].set(f"{f_new:.3f}")   # triggers reparse + redraw
+        _sv_set_status(f"Fit: BPM scale set to {f_new:.3f} so the chart ends near "
+                       f"the song end ({adur:.0f}s).")
+
+    tk.Button(sv_bpm_row, text="⇥ Fit to audio", font=("Segoe UI", 9),
+              relief="flat", bd=0, padx=10, pady=4, cursor="hand2",
+              bg=COL["card2"], fg=COL["accent"], activebackground=COL["border_hi"],
+              command=_sv_fit_bpm).pack(side="left", padx=(12, 2))
+
+    def _sv_bpm_entry_changed(*_):
+        try:
+            v = float(vars_["bpm_factor"].get())
+            sv_bpm_scale.set(v)
+            sv_bpm_lbl.configure(text=f"×{v:.3f}")
+            _sv_reparse_notes()
+        except ValueError:
+            pass
+    vars_["bpm_factor"].trace_add("write", _sv_bpm_entry_changed)
 
     def _sv_nudge(delta):
         ti = _sv["track_idx"]
@@ -4391,6 +5030,94 @@ def run_gui():
               bg=COL["card2"], fg=COL["muted"], activebackground=COL["border_hi"],
               command=_sv_reset_lrc).pack(side="left", padx=(16, 2))
 
+    # ── Tap-to-Sync: time every line in ONE playthrough ───────────────────
+    # Play the song and tap SPACE (or TAP) right as each line starts. Each tap
+    # stamps the current time to the next line and advances — far faster than
+    # dragging, and each placement is direct (no cascade). Writes the .lrc.
+    _tap_state = {"idx": None}
+    _tap_status_var = tk.StringVar(value="")
+
+    def _tap_next_text():
+        lrc = _sv.get("lrc") or []
+        i = _tap_state["idx"]
+        if i is None or i >= len(lrc):
+            return ""
+        return f"▶ next ({i+1}/{len(lrc)}): {lrc[i][1][:40]}"
+
+    def _tap_stamp(event=None):
+        if _tap_state["idx"] is None:
+            return None
+        lrc = _sv.get("lrc") or []
+        i = _tap_state["idx"]
+        if i >= len(lrc):
+            _tap_end(); return "break"
+        lrc[i] = (round(_sv_elapsed(), 3), lrc[i][1])
+        _tap_state["idx"] = i + 1
+        _sv_draw_tab()
+        if _tap_state["idx"] >= len(lrc):
+            _tap_end()
+        else:
+            _tap_status_var.set(_tap_next_text())
+        return "break"
+
+    def _tap_end(*_):
+        if _tap_state["idx"] is None:
+            return
+        _tap_state["idx"] = None
+        try: root.unbind("<space>")
+        except Exception: pass
+        _sv_write_lrc()
+        _tap_status_var.set("✓ Lyrics placed — drag any line to fine-tune.")
+
+    def _tap_start():
+        if not _sv.get("lrc"):
+            return _sv_set_status("Load lyrics first.")
+        if not (vars_["audio"].get() and os.path.isfile(vars_["audio"].get())):
+            return _sv_set_status("Load audio first.")
+        if _sv.get("_vocals_label"):
+            sv_track_var.set(_sv["_vocals_label"])
+        _sv["vocal_mode"] = True
+        _tap_state["idx"] = 0
+        start_at = max(0.0, (_sv.get("lrc") or [[0.0]])[0][0] - 2.0)
+        _sv["offset"] = start_at
+        _tap_status_var.set(_tap_next_text())
+        root.bind("<space>", _tap_stamp)
+        try: _sv_play()
+        except Exception: pass
+
+    # Tap-Sync / TAP removed per user preference. Lyric lines are placed by
+    # switching the track selector to "🎤 Vocals" and dragging each line on the
+    # timeline; drag a line's right edge to stretch/shrink where it ends.
+    styled(tk.Frame(sv_lrc_row, width=1, height=20), bg="border").pack(side="left", padx=10, fill="y")
+    styled(tk.Label(sv_lrc_row,
+                    text="Tip: pick 🎤 Vocals above to drag lines — drag a line's right edge to set where it ends",
+                    font=("Segoe UI", 8)),
+           fg="dim", bg="surface").pack(side="left", padx=(6, 0))
+
+    def _sv_write_lrc():
+        """Persist the (possibly re-dragged / tapped) lyric times to a .lrc and
+        point the build at it. Resets the lyrics-offset since times are now absolute."""
+        lrc_path = vars_["lyrics"].get()
+        if not lrc_path:
+            _sv_set_status("No lyrics file set."); return
+        if not lrc_path.lower().endswith(".lrc"):
+            lrc_path = os.path.splitext(lrc_path)[0] + ".lrc"
+        try:
+            lines = sorted(_sv.get("lrc") or [], key=lambda x: x[0])
+            with open(lrc_path, "w", encoding="utf-8") as f:
+                for (t, txt) in lines:
+                    t2 = max(0.0, t); m = int(t2) // 60; s = t2 - m * 60
+                    f.write(f"[{m:02d}:{s:05.2f}]{txt}\n")
+            _sv["lrc"] = lines
+            _sv["lrc_dur"] = {}
+            vars_["lyrics"].set(lrc_path)
+            vars_["lrc_offset"].set("0.00")
+            try: sv_lrc_val_var.set("+0.00")
+            except Exception: pass
+            _sv_set_status(f"Saved {len(lines)} lyric lines → {os.path.basename(lrc_path)}")
+        except Exception as ex:
+            _sv_set_status(f"Couldn't write .lrc: {ex}")
+
     # ── action row ────────────────────────────────────────────────────────
     sv_act = styled(tk.Frame(sync_page), bg="surface")
     sv_act.pack(anchor="center", pady=(0, 8))
@@ -4399,6 +5126,16 @@ def run_gui():
         audio_path = vars_["audio"].get()
         if not audio_path or not os.path.isfile(audio_path):
             _sv_set_status("No audio file."); return
+
+        # Kill any ffplay already running first — otherwise each Play/scrub/restart
+        # spawns a NEW ffplay on top of the old one (orphaned, keeps playing) and
+        # you get stacked, unstoppable audio.
+        _old = _sv.get("proc")
+        if _old is not None:
+            try: subprocess.run(["taskkill", "/F", "/T", "/PID", str(_old.pid)],
+                                capture_output=True, creationflags=CREATE_NO_WINDOW)
+            except Exception: pass
+            _sv["proc"] = None
 
         # Find ffplay — check PATH, then next to ffmpeg.exe, then app folder
         ffplay = _find_exe("ffplay")
@@ -4437,6 +5174,11 @@ def run_gui():
             try: subprocess.run(["taskkill","/F","/T","/PID",str(p.pid)],
                                 capture_output=True, creationflags=CREATE_NO_WINDOW)
             except Exception: pass
+        # Safety net: also kill any stray/orphaned ffplay (-nodisp) instances that
+        # got stacked from earlier. The sync player is the only ffplay on this tab.
+        try: subprocess.run(["taskkill","/F","/IM","ffplay.exe"],
+                            capture_output=True, creationflags=CREATE_NO_WINDOW)
+        except Exception: pass
         _sv["proc"] = None
         _sv["t0"]   = None
         if _sv.get("after_id"):
@@ -4474,13 +5216,10 @@ def run_gui():
             _sv["offset"] = off
             root.after(15, _sv_play)
     def _on_vol_change(*_):
-        # ffplay's volume is fixed at launch, so a live preview means relaunching.
-        # Throttle that to ~once every 250ms while dragging: the volume tracks the
-        # slider without the every-pixel thrash that froze playback before.
+        # ffplay's volume is fixed at launch, so changing it means relaunching —
+        # which stutters. So while DRAGGING we only store the value; we apply it
+        # once on release (_apply_vol). No mid-drag restarts = no lag.
         _sv["vol"] = int(float(_sv_vol_var.get()))
-        if _sv["t0"] is None or _vol_pending[0] is not None:
-            return                               # not playing, or a restart is queued
-        _vol_pending[0] = root.after(250, _vol_restart_now)
     def _apply_vol(*_):
         # On release, apply the final value immediately (cancel any queued restart).
         if _vol_pending[0] is not None:
@@ -4532,15 +5271,12 @@ def run_gui():
               bg=COL["card2"], fg=COL["dim"], activebackground=COL["card"],
               command=_sv_redownload_ffplay).pack(side="left")
 
+    # Status line only — it's empty unless there's something to act on (parse
+    # error, out-of-range notes, etc). The old static "TIP:" reminder lived
+    # here permanently as clutter; that guidance is in the Help page instead.
     styled(tk.Label(sync_page, textvariable=sync_status_var, font=("Segoe UI", 9),
                     wraplength=1100, justify="left"),
            fg="muted", bg="surface").pack(anchor="w", padx=28, pady=(0, 6))
-
-    styled(tk.Label(sync_page,
-        text="TIP: BPM scale < 1.0 slows the note chart (use if notes run ahead of audio). "
-             "Click the tab canvas to seek. Leadin nudge shifts the whole chart left/right.",
-        font=("Segoe UI", 8), wraplength=1100, justify="left"),
-        fg="dim", bg="surface").pack(anchor="w", padx=28)
 
     # PAGE: LOG
     # ══════════════════════════════════════════════════════════════════════
@@ -4557,6 +5293,76 @@ def run_gui():
     # ══════════════════════════════════════════════════════════════════════
     # PAGE: HELP
     # ══════════════════════════════════════════════════════════════════════
+    # ── PAGE: TONE DESIGNER (preview / recommend / compare / import) ──────
+    def _tone_get_tracks():
+        gp = _gp_ref[0]
+        out = []
+        if not gp:
+            return out
+        for r in track_rows:
+            try:
+                idx = r["index"]
+                nm = " ".join((gp.tracks[idx].findtext("Name") or f"Track {idx}").split())
+                kind = gp.track_kind(idx) or "guitar"
+                out.append({"name": nm, "kind": kind,
+                            "arr": r["var_arr"].get(), "tone": r["var_tone"].get()})
+            except Exception:
+                pass
+        return out
+
+    def _tone_get_notes(is_bass):
+        """Song's own phrasing from the Sync tab's parsed notes -> [(t, midi)]."""
+        try:
+            notes = _sv.get("notes") or []
+            gp = _sv.get("gp"); ti = _sv.get("track_idx")
+            if not notes or gp is None:
+                return None
+            tun = gp.tuning(ti)
+            out = []
+            for nd in notes[:64]:
+                s = nd.get("s", 0); fret = nd.get("fret", 0)
+                if 0 <= s < len(tun):
+                    out.append((nd.get("t", 0.0), tun[s] + fret))
+            return out or None
+        except Exception:
+            return None
+
+    def _tone_on_import(label, preset):
+        # Make imported tones selectable in future arrangement tone pickers.
+        try:
+            if label not in PRESET_LABELS:
+                PRESET_LABELS.append(label)
+            akey = ((preset.get("GearList", {}).get("Amp", {}) or {})
+                    .get("Key", "")).lower()
+            if "bass" in akey or label.lower().startswith("bass"):
+                if label not in BASS_PRESETS:
+                    BASS_PRESETS.append(label)
+            else:
+                if label not in GUITAR_PRESETS:
+                    GUITAR_PRESETS.append(label)
+        except Exception:
+            pass
+
+    tone_page = styled(tk.Frame(page_container), bg="surface"); pages["tone"] = tone_page
+    if tone_designer is not None:
+        try:
+            tone_designer.build_tone_tab(tone_page, {
+                "tk": tk, "ttk": ttk, "COL": COL, "TONE_PRESETS": TONE_PRESETS,
+                "get_tracks": _tone_get_tracks, "get_notes": _tone_get_notes,
+                "find_exe": _find_exe, "log": log, "on_import": _tone_on_import,
+                "filedialog": filedialog, "messagebox": messagebox,
+            })
+        except Exception as _te:
+            styled(tk.Label(tone_page,
+                            text=f"Tone Designer failed to load:\n{_te}",
+                            font=("Segoe UI", 10), justify="left"),
+                   fg="fg", bg="surface").pack(padx=28, pady=28, anchor="w")
+    else:
+        styled(tk.Label(tone_page,
+                        text="tone_designer.py not found next to the app.",
+                        font=("Segoe UI", 10)),
+               fg="fg", bg="surface").pack(padx=28, pady=28, anchor="w")
+
     help_page = styled(tk.Frame(page_container), bg="surface"); pages["help"] = help_page
     page_header(help_page, "How to Use RS Studio")
 
@@ -4604,6 +5410,20 @@ def run_gui():
         "• Click  + Start New Project  on the splash screen, or drag a .gp file directly onto the window.",
         "• RS Studio reads the title, artist, BPM, and track layout from the file automatically.",
         "• Non-guitar tracks (drums, saxophone, piano, etc.) are filtered out — only guitar and bass appear.",
+    ])
+
+    _help_section("Alternate Start — Import Tabs from a PDF", [
+        "No Guitar Pro file for the song? RS Studio can build one for you from Ultimate Guitar's printable tab PDFs — no Guitar Pro app needed.",
+        "",
+        "• On Ultimate Guitar, open the tab and use its Print button to save a PDF for each part you want (bass, lead, rhythm).",
+        "• Name the PDFs so the part is obvious — e.g. song-bass.pdf, song-lead.pdf, song-rhythm.pdf — RS Studio uses the filename to tell the tracks apart and order them.",
+        "• Click  📄 Import PDF Tab  on the Main page and select 1-3 PDFs for the same song — that's it, no extra prompts.",
+        "• RS Studio reads notes, rhythm, tempo, tuning, section labels, and lyrics straight from the PDF, builds a .gp5 file next to your PDFs, and loads it automatically — pick up at Step 2 below.",
+        "• Lyrics are handled for you: if the PDF has a lyric line, pdf2gp builds a timed .lrc straight from it and RS Studio uses that — Auto-Fetch Media won't re-search or overwrite it. If the PDF had no lyrics, Auto-Fetch falls back to its normal lrclib.net / Genius / AI-timestamp search. For the cleanest spelling, drop a matching lyrics .txt (pasted from Genius or anywhere) into the same folder as your PDFs before importing — pdf2gp picks it up automatically, no need to select it.",
+        "• First use installs a few extra Python packages automatically (a one-time download, a minute or two).",
+        "• For the best lyric spelling and accents, install Tesseract OCR (tick Spanish under additional languages if needed): https://github.com/UB-Mannheim/tesseract/wiki — this is optional, import still works without it.",
+        "• Built for Ultimate Guitar's own print-to-PDF layout. Grace notes, slides, hammer-ons/pull-offs, and strum arrows aren't captured; unusual measures may log a 'warn measure N' note on the Log page.",
+        "• Check the tempo after importing: if the PDF's printed tempo mark couldn't be read, pdf2gp defaults to 120 BPM and logs a WARNING on the Log page — that default is almost never the song's real tempo. Fix it in the BPM field on the Main page, or load audio and click  Auto ↺  on the Sync page to rescale it to match.",
     ])
 
     _help_section("Step 2 — Auto-Fetch Audio & Artwork", [
@@ -4663,12 +5483,13 @@ def run_gui():
 
     _help_section("Tips & Troubleshooting", [
         "• No audio after Auto-Fetch? Make sure yt-dlp.exe and ffmpeg.exe are in the same folder as the app.",
-        "• Build failed? Check the Log page for the exact error. Common causes: missing packer path, bad audio format, or no arrangements selected.",
+        "• Build failed? Check the Log page for the exact error. Common causes: RSDDC_Build2.exe missing (re-run auto-setup), bad audio format, or no arrangements selected.",
         "• Lyrics not showing in-game? Make sure the .lrc file path is set in the Lyrics field on the Main page.",
         "• Wrong song fetched from YouTube? Paste a direct YouTube link into Audio URL before clicking Auto-Fetch.",
         "• Volume too loud in-game? Lower the Volume field (e.g. -12 instead of -8) and rebuild.",
         "• AI timestamps require faster-whisper — RS Studio installs it automatically on first use.",
         "• Change theme colors anytime via the  ◐ Theme  tab — your accent color is saved between sessions.",
+        "• PDF import failed or looks wrong? Check the Log page — it prints per-PDF stats (systems/measures/notes) and 'warn measure N' notes for anything approximated. Make sure the PDF is Ultimate Guitar's own print-to-PDF export, not a scan or a different site's tab.",
     ])
 
     tk.Frame(help_inner, height=40, bg=COL["surface"]).pack()
@@ -4863,20 +5684,43 @@ def run_gui():
             if not target_url:
                 cl_title = clean_title_for_api(title)
                 cl_artist = clean_title_for_api(artist)
-                # Try YouTube Music first (better album/year metadata), fall back to general YouTube
-                root.after(0, lambda: loading_lbl.configure(text="Searching YouTube Music…"))
-                ytm_url = f"ytmsearch1:{cl_artist} {cl_title}"
-                yt_url  = f"ytsearch1:{cl_artist} {cl_title} lyric video"
-                # Run yt-dlp with YouTube Music search; fall back to regular YouTube
+                # Prefer LYRIC VIDEOS: search them first and score them highest.
+                # Only fall back to YouTube Music (clean audio) if none are found.
+                ytm_url = f"ytmsearch5:{cl_artist} {cl_title}"
+                yt_url  = f"ytsearch10:{cl_artist} {cl_title} lyric video letra"
                 def _try_search(url):
                     cmd = [ytdlp, "--dump-json", "--no-warnings", "--no-playlist", url]
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, creationflags=CREATE_NO_WINDOW)
+                    try:
+                        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, creationflags=CREATE_NO_WINDOW)
+                    except subprocess.TimeoutExpired:
+                        # Don't let a slow/stuck search hang the whole flow — treat it
+                        # like "no results" so the caller falls through to the next
+                        # strategy (or surfaces a clear error if both time out).
+                        log(f"  [fetch] YouTube search timed out (30s): {url}")
+                        return []
                     return [l for l in r.stdout.split('\n') if l.strip().startswith('{')]
-                lines = _try_search(ytm_url)
+                # This used to run unguarded — an unhandled exception here (e.g. a
+                # network hiccup raising something other than TimeoutExpired) would
+                # silently kill the background thread and leave the modal frozen on
+                # "Searching..." forever, with no error shown. Wrap it so any failure
+                # is visible instead of an invisible hang.
+                try:
+                    root.after(0, lambda: loading_lbl.configure(text="Searching YouTube for a lyric video…"))
+                    lines = _try_search(yt_url)            # lyric videos first
+                    if not lines:
+                        root.after(0, lambda: loading_lbl.configure(text="Trying YouTube Music…"))
+                        lines = _try_search(ytm_url)       # fallback: clean audio
+                    target_url = yt_url  # used for webpage_url fallback
+                except Exception as _se:
+                    log(f"  [fetch] YouTube search failed: {_se}")
+                    root.after(0, lambda e=_se: loading_lbl.configure(
+                        text=f"✗ YouTube search failed: {e}", fg=COL["warn"]))
+                    return
                 if not lines:
-                    root.after(0, lambda: loading_lbl.configure(text="Trying YouTube…"))
-                    lines = _try_search(yt_url)
-                target_url = ytm_url  # used for webpage_url fallback
+                    root.after(0, lambda: loading_lbl.configure(
+                        text="✗ No YouTube results found. Try pasting a direct YouTube URL instead.",
+                        fg=COL["warn"]))
+                    return
             else:
                 root.after(0, lambda: loading_lbl.configure(text="Extracting metadata…"))
             try:
@@ -4887,10 +5731,29 @@ def run_gui():
                     lines = [l for l in res.stdout.split('\n') if l.strip().startswith('{')]
                 if not lines:
                     raise Exception("No video data found. Try pasting a direct YouTube URL.")
-                vdata = json.loads(lines[0])
+                # GP tab length (Songsterr tabs are timed to a specific master) —
+                # used to pick the closest-length audio so the chart lines up
+                # without stretching the ending.
+                _gp_tab_dur = None
+                try:
+                    _gpp = vars_["gp"].get()
+                    if _gpp and os.path.isfile(_gpp):
+                        _gp_tab_dur = get_gp_content_duration(_gpp)
+                except Exception:
+                    _gp_tab_dur = None
+                # Choose the cleanest source closest in length to the GP tab.
+                vdata = _pick_clean_audio(lines, target_dur=_gp_tab_dur)
                 v_title = vdata.get("title", "Unknown Title")
                 v_chan  = vdata.get("uploader", "Unknown Channel")
                 v_dur   = vdata.get("duration_string", "0:00")
+                if _gp_tab_dur:
+                    try:
+                        _cd = float(vdata.get("duration") or 0)
+                        if _cd > 0:
+                            log(f"  [audio] GP tab ≈ {_gp_tab_dur:.0f}s · picked "
+                                f"audio {_cd:.0f}s (Δ {abs(_cd-_gp_tab_dur):.0f}s)")
+                    except Exception:
+                        pass
                 # Pick highest-res thumbnail
                 thumbs = vdata.get("thumbnails", [])
                 v_thumb = thumbs[-1].get("url","") if thumbs else vdata.get("thumbnail","")
@@ -5139,12 +6002,20 @@ def run_gui():
                 if not _yt_artist: _yt_artist = (_ym_artist or _vt_artist).title()
                 if not _yt_title:  _yt_title  = (_ym_track  or _vt_title ).title()
 
-                # Always update UI fields from YouTube — more reliable than GP file metadata
-                if _yt_artist: vars_["artist"].set(_yt_artist)
-                if _yt_title:  vars_["title"].set(_yt_title)
+                # Only fill artist/title from YouTube when the field is EMPTY.
+                # GP-file metadata (set in load_gp) is the authoritative source for
+                # the song title/artist; YouTube video titles are frequently parsed
+                # into the wrong fields ("Official Video", channel name, etc.) which
+                # then poisons the lyrics lookup. Keep the reliable GP values.
+                if _yt_artist and not vars_["artist"].get().strip():
+                    vars_["artist"].set(_yt_artist)
+                if _yt_title and not vars_["title"].get().strip():
+                    vars_["title"].set(_yt_title)
 
-                # Cache for lrclib search — always use YouTube-sourced values, not GP metadata
-                _yt_meta_cache[0] = {"artist": _yt_artist, "title": _yt_title}
+                # Cache YouTube-sourced values as a FALLBACK only (used when the UI
+                # fields are blank). Lyrics lookup prefers the UI/GP fields.
+                _yt_meta_cache[0] = {"artist": _yt_artist, "title": _yt_title,
+                                     "raw_title": _raw_vt}
 
                 _close()
                 _trigger_automagic(v_url)
@@ -5203,37 +6074,10 @@ def run_gui():
                         urllib.request.urlretrieve(_hires, _art_path)
                         root.after(0, lambda p=_art_path: vars_["art"].set(p))
                         log("  [art] ✓ Cover art downloaded from iTunes")
-                    # Auto-correct title from iTunes — GP files are often truncated/wrong.
-                    # iTunes trackName is authoritative for commercial releases.
-                    _itunes_track = _hit.get("trackName", "").strip()
-                    if _itunes_track:
-                        _cur_title = vars_["title"].get().strip()
-                        if not _cur_title or len(_itunes_track) > len(_cur_title):
-                            root.after(0, lambda t=_itunes_track: vars_["title"].set(t))
-                            log("  [art] ✓ Title corrected from iTunes: " + _itunes_track)
-                    # Auto-fill artist from iTunes if blank
-                    _itunes_artist = _hit.get("artistName", "").strip()
-                    if _itunes_artist:
-                        _cur_artist = vars_["artist"].get().strip()
-                        if not _cur_artist:
-                            root.after(0, lambda a=_itunes_artist: vars_["artist"].set(a))
-                            log("  [art] ✓ Artist from iTunes: " + _itunes_artist)
-                    # Auto-fill album name if still blank or generic.
-                    # Strip trailing "- Single" / "- EP" — iTunes marks standalone
-                    # releases this way but the in-game field should show the real album.
-                    import re as _re_alb
-                    _itunes_album = _hit.get("collectionName", "").strip()
-                    _itunes_album = _re_alb.sub(
-                        r'\s*[-–]\s*(Single|EP|Deluxe.*|Remaster.*|Live.*|Acoustic.*)$',
-                        "", _itunes_album, flags=_re_alb.IGNORECASE).strip()
-                    if _itunes_album:
-                        _cur_album = vars_["album"].get().strip()
-                        _cur_clean  = _re_alb.sub(
-                            r'\s*[-–]\s*(Single|EP)$', "", _cur_album,
-                            flags=_re_alb.IGNORECASE).strip()
-                        if not _cur_clean or _cur_clean.lower() in ("single", "unknown", ""):
-                            root.after(0, lambda a=_itunes_album: vars_["album"].set(a))
-                            log("  [art] ✓ Album: " + _itunes_album)
+                    # NOTE: title/artist/album/year are set authoritatively by the
+                    # itunes_metadata() step in the download worker (runs before the
+                    # lyrics lookup). This thread only handles cover art now, to
+                    # avoid two threads racing to write the same fields.
             except Exception as _ae:
                 log("  [art] Art fetch failed: " + str(_ae))
         threading.Thread(target=_fetch_art, daemon=True).start()
@@ -5343,6 +6187,11 @@ def run_gui():
                         if f.startswith(song_key) and f.lower().endswith(_AUD_EXTS):
                             raw_audio = os.path.join(dest_dir, f); break
 
+                # Quality check on the ORIGINAL downloaded file, before any WAV
+                # conversion below (which would mask the real source quality).
+                if raw_audio and os.path.exists(raw_audio):
+                    check_audio_quality(raw_audio, log)
+
                 if not raw_audio or not os.path.exists(raw_audio):
                     err_detail = (proc.stderr or b"").decode("utf-8", errors="replace")[-600:]
                     log(f"  [fetch] yt-dlp stderr: {err_detail}")
@@ -5398,17 +6247,96 @@ def run_gui():
                     except Exception as pe:
                         log(f"  [fetch] Preview generation failed: {pe}")
 
-                # Fetch synced lyrics from lrclib.net
+                # ── Authoritative metadata from iTunes ─────────────────────────
+                # YouTube gives us the audio; iTunes gives us the real
+                # title/artist/album/year. Runs BEFORE the lyrics lookup so the
+                # lyrics search uses clean data (not YouTube-parsed text).
+                _meta = {}
                 try:
-                    # Use the longest/best title across: UI field (may be iTunes-corrected by now),
-                    # YouTube cache. Longer string wins — GP metadata is often truncated.
+                    _seed_artist = (vars_["artist"].get().strip()
+                                    or _yt_meta_cache[0].get("artist", ""))
+                    _seed_title  = (vars_["title"].get().strip()
+                                    or _yt_meta_cache[0].get("title", ""))
+                    root.after(0, lambda: _safe_status("Looking up song info (iTunes)…"))
+                    _meta = itunes_metadata(_seed_artist, _seed_title) or {}
+                    # Confidence guard: if iTunes returns something unrelated to the
+                    # seed (wrong song entirely), don't let it clobber the fields.
+                    # NOTE: the "seed" here is usually the raw heuristic YouTube-title
+                    # parse, which is itself unreliable (casing, multi-artist joins,
+                    # accents, "feat." clutter). A score>=2 iTunes match already means
+                    # itunes_metadata() matched BOTH title and artist substrings against
+                    # that same seed, so re-vetoing it with a strict text-similarity
+                    # ratio was throwing away good corrections. Only weak (title-only)
+                    # matches get the extra scrutiny now.
+                    if _meta and _seed_title.strip() and (_meta.get("match_score", 0) < 2):
+                        import difflib as _dl
+                        def _nrm(s): return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+                        _ts = _dl.SequenceMatcher(None, _nrm(_meta.get("title")),
+                                                  _nrm(_seed_title)).ratio()
+                        _as = _dl.SequenceMatcher(None, _nrm(_meta.get("artist")),
+                                                  _nrm(_seed_artist)).ratio()
+                        if _ts < 0.45 and _as < 0.45:
+                            _rej_msg = (f"iTunes match '{_meta.get('artist')} - "
+                                        f"{_meta.get('title')}' looked unrelated to "
+                                        f"'{_seed_artist} - {_seed_title}' — kept the "
+                                        f"YouTube-parsed title/artist instead. Double-check "
+                                        f"Song Info on the Main tab.")
+                            log(f"  [meta] {_rej_msg}")
+                            root.after(0, lambda m=_rej_msg: _safe_status(m))
+                            root.after(0, lambda m="⚠ " + _rej_msg: _sv_set_status(m))
+                            _meta = {}
+                    if _meta:
+                        if _meta.get("title"):
+                            root.after(0, lambda v=_meta["title"]:  vars_["title"].set(v))
+                        if _meta.get("artist"):
+                            root.after(0, lambda v=_meta["artist"]: vars_["artist"].set(v))
+                        if _meta.get("album"):
+                            root.after(0, lambda v=_meta["album"]:  vars_["album"].set(v))
+                        if _meta.get("year"):
+                            root.after(0, lambda v=_meta["year"]:   vars_["year"].set(v))
+                        if _meta.get("art_url") and not (
+                                vars_["art"].get() and os.path.isfile(vars_["art"].get())):
+                            try:
+                                _ap = os.path.join(dest_dir, "cover.jpg")
+                                import urllib.request as _ur2
+                                with _ur2.urlopen(_ur2.Request(
+                                        _meta["art_url"],
+                                        headers={"User-Agent": "Mozilla/5.0"}),
+                                        timeout=10) as _ir, open(_ap, "wb") as _of:
+                                    shutil.copyfileobj(_ir, _of)
+                                root.after(0, lambda p=_ap: vars_["art"].set(p))
+                            except Exception:
+                                pass
+                        log(f"  [meta] iTunes: '{_meta.get('artist')}' — "
+                            f"'{_meta.get('title')}' [{_meta.get('album')} "
+                            f"{_meta.get('year')}]")
+                    else:
+                        log("  [meta] iTunes: no confident match — keeping current fields.")
+                except Exception as _me:
+                    log(f"  [meta] iTunes lookup failed: {_me}")
+
+                # Fetch synced lyrics from lrclib.net — but not if good lyrics are
+                # already sitting in vars_["lyrics"] (e.g. the .lrc pdf2gp built
+                # straight from the tab's own lyric line, or anything the user
+                # loaded manually). Re-fetching would silently overwrite those
+                # with a generic online match instead of using what's already there.
+                _existing_lyrics_ok = bool(vars_["lyrics"].get()) and os.path.exists(vars_["lyrics"].get())
+                if _existing_lyrics_ok:
+                    log(f"  [fetch] Lyrics already present ({os.path.basename(vars_['lyrics'].get())}) — skipping lyrics auto-fetch.")
+                    synced_lrc = None
+                    _saved_txt_path = None
+                try:
+                    if _existing_lyrics_ok:
+                        raise _SkipBlock
+                    # Prefer iTunes metadata, then the UI/GP fields, then the
+                    # YouTube cache — so the lyrics search uses the cleanest data.
                     _yt_cache = _yt_meta_cache[0]
                     _ui_artist = vars_["artist"].get().strip()
                     _ui_title  = vars_["title"].get().strip()
                     _yt_artist = _yt_cache.get("artist", "")
                     _yt_title  = _yt_cache.get("title",  "")
-                    o_artist = (_ui_artist if len(_ui_artist) >= len(_yt_artist) else _yt_artist).strip()
-                    o_title  = (_ui_title  if len(_ui_title)  >= len(_yt_title)  else _yt_title ).strip()
+                    o_artist = (_meta.get("artist") or _ui_artist or _yt_artist).strip()
+                    o_title  = (_meta.get("title")  or _ui_title  or _yt_title ).strip()
                     root.after(0, lambda: _safe_status("Fetching lyrics…"))
                     log(f"  [fetch] Looking up lyrics: artist='{o_artist}' title='{o_title}'")
                     _LRCLIB_HDR = {"User-Agent": "gp2rs-studio/2.0"}
@@ -5592,6 +6520,8 @@ def run_gui():
                         log(f"  [fetch] Synced lyrics saved: {lrc_dest}")
                     else:
                         log("  [fetch] No synced lyrics found — will auto-timestamp with Whisper if plain lyrics were saved")
+                except _SkipBlock:
+                    pass
                 except Exception as le:
                     log(f"  [fetch] Lyrics fetch failed: {le}")
 
@@ -6051,7 +6981,47 @@ def run_gui():
             messagebox.showinfo("BPM", "Couldn't detect a tempo automatically — enter it manually.")
 
     # ══ LOAD GP ════════════════════════════════════════════════════════════════════════════════════════
+    def _maybe_convert_gp(path):
+        """Old Guitar Pro formats (.gp3/.gp4/.gp5/.gpx) aren't gpif — convert them
+        to a GP7-style .gp (via PyGuitarPro) so the rest of the app can read them.
+        Modern GP7/8 .gp (a zip with Content/score.gpif) is returned unchanged."""
+        import zipfile as _zf
+        try:
+            with _zf.ZipFile(path) as _z:
+                if "Content/score.gpif" in _z.namelist():
+                    return path
+        except Exception:
+            pass  # not a zip -> old binary format
+        try:
+            import guitarpro  # noqa: F401
+        except Exception:
+            if not getattr(sys, "frozen", False):
+                try:
+                    subprocess.run([sys.executable, "-m", "pip", "install",
+                                    "--quiet", "pyguitarpro"],
+                                   creationflags=CREATE_NO_WINDOW)
+                except Exception:
+                    pass
+            try:
+                import guitarpro  # noqa: F401
+            except Exception:
+                messagebox.showerror("Older Guitar Pro file",
+                    "This is an older Guitar Pro file (.gp3/.gp4/.gp5/.gpx). To "
+                    "load it, install PyGuitarPro:\n\n    pip install pyguitarpro")
+                return path
+        try:
+            import gp_convert
+            out = os.path.splitext(path)[0] + "_converted.gp"
+            log(f"  [gp] converting older Guitar Pro format -> {os.path.basename(out)}")
+            gp_convert.convert(path, out)
+            return out
+        except Exception as _ce:
+            messagebox.showerror("Conversion failed",
+                f"Couldn't convert that Guitar Pro file:\n{_ce}")
+            return path
+
     def load_gp(path, _keep_media=False):
+        path = _maybe_convert_gp(path)
         vars_["gp"].set(path)
         startup_overlay.place_forget(); player_bar.grid()
         for w in arr_grid.winfo_children(): w.destroy()
@@ -6091,32 +7061,122 @@ def run_gui():
         _existing_audio = vars_["audio"].get().strip()
         if not _existing_audio or not os.path.exists(_existing_audio):
             root.after(300, _show_media_inspector)
-        headers = ["", "Track", "Arrangement", "Tone preset"]
-        widths   = [3, 28, 12, 22]
+        headers = ["", "Track", "Arrangement", "Tone preset (default)", "Tone changes"]
+        widths   = [3, 28, 12, 22, 14]
         for ci, (h, wd) in enumerate(zip(headers, widths)):
             styled(tk.Label(arr_grid, text=h, font=("Segoe UI Semibold", 8)),
                    fg="muted", bg="card").grid(row=0, column=ci, sticky="w",
                    padx=6, pady=(0, 4), ipadx=wd)
+
+        def _fmt_mmss(sec):
+            sec = max(0.0, float(sec))
+            return f"{int(sec) // 60}:{int(sec) % 60:02d}"
+
+        def _parse_mmss(s):
+            s = (s or "").strip()
+            if ":" in s:
+                mm, _, ss = s.partition(":")
+                return max(0.0, float(mm or 0) * 60 + float(ss or 0))
+            return max(0.0, float(s or 0))
+
+        def _open_tone_changes(row, tones_list, btn):
+            win = tk.Toplevel(root)
+            win.title("Tone Changes")
+            win.configure(bg=COL["card"])
+            win.geometry("420x380")
+            styled(tk.Label(win,
+                text=f"Default tone (plays from song start): {row['var_tone'].get()}\n"
+                     "Add timed switches to other tones. Rocksmith allows up to 4 "
+                     "on top of the default — switching back to the default sound "
+                     "later just means adding another change to a tone with the "
+                     "same settings (you can't re-select the default itself).",
+                font=("Segoe UI", 8), wraplength=390, justify="left"),
+                fg="muted", bg="card").pack(fill="x", padx=10, pady=(10, 6))
+
+            lb = tk.Listbox(win, font=("Segoe UI", 9), height=10,
+                             bg=COL["field"], fg=COL["fg"],
+                             selectbackground=COL["accent"], relief="flat",
+                             highlightthickness=0)
+            lb.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+            def _refresh():
+                lb.delete(0, "end")
+                for ev in sorted(row["tone_changes"], key=lambda e: e["time"]):
+                    lb.insert("end", f"{_fmt_mmss(ev['time'])}  →  {ev['tone_label']}")
+                n = len(row["tone_changes"])
+                btn.configure(text=("Default only" if n == 0
+                                    else f"+{n} change" + ("s" if n != 1 else "")))
+            _refresh()
+
+            add_row = styled(tk.Frame(win), bg="card")
+            add_row.pack(fill="x", padx=10, pady=(0, 6))
+            styled(tk.Label(add_row, text="At", font=("Segoe UI", 9)),
+                   fg="muted", bg="card").pack(side="left")
+            time_var = tk.StringVar(value="0:00")
+            styled(tk.Entry(add_row, textvariable=time_var, width=7,
+                            relief="flat", font=("Segoe UI", 9)),
+                   bg="field", fg="fg", insertbackground="accent_hi").pack(side="left", padx=(4, 8))
+            tone_var = tk.StringVar(value=tones_list[0] if tones_list else "")
+            ttk.Combobox(add_row, textvariable=tone_var, width=18,
+                         state="readonly", values=tones_list).pack(side="left")
+
+            def _add():
+                try:
+                    t = _parse_mmss(time_var.get())
+                except ValueError:
+                    return messagebox.showerror("Bad time", "Use mm:ss or seconds, e.g. 1:23")
+                row["tone_changes"].append({"time": t, "tone_label": tone_var.get()})
+                _refresh()
+            tk.Button(win, text="+ Add change", font=("Segoe UI", 9), relief="flat", bd=0,
+                      padx=10, pady=6, cursor="hand2", bg=COL["accent"], fg="#ffffff",
+                      activebackground=COL["accent_hi"], command=_add).pack(
+                anchor="e", padx=10, pady=(0, 8))
+
+            def _remove():
+                sel = lb.curselection()
+                if not sel: return
+                items = sorted(row["tone_changes"], key=lambda e: e["time"])
+                del items[sel[0]]
+                row["tone_changes"] = items
+                _refresh()
+            btn_row = styled(tk.Frame(win), bg="card")
+            btn_row.pack(fill="x", padx=10, pady=(0, 10))
+            tk.Button(btn_row, text="Remove selected", font=("Segoe UI", 9), relief="flat", bd=0,
+                      padx=10, pady=6, cursor="hand2", bg=COL["card2"], fg=COL["fg"],
+                      activebackground=COL["border_hi"], command=_remove).pack(side="left")
+            tk.Button(btn_row, text="Close", font=("Segoe UI", 9), relief="flat", bd=0,
+                      padx=10, pady=6, cursor="hand2", bg=COL["card2"], fg=COL["fg"],
+                      activebackground=COL["border_hi"], command=win.destroy).pack(side="right")
+
         guitars = 0
         for i in range(len(gp.tracks)):
             kind = gp.track_kind(i)
             if kind is None:
                 continue
             name = " ".join((gp.tracks[i].findtext("Name") or f"Track {i}").split())
-            tuning_str = gp.tuning(i)
+            _tun = gp.tuning(i)
+            tuning_str = gp2rs.tuning_name(_tun, is_bass=(kind == "bass"))
             preset = auto_preset(name)
             if kind == "bass":
                 arr, tones = "Bass", BASS_PRESETS
                 if preset not in tones:
                     preset = "Bass - Rock"
             else:
-                arr, tones = ("Lead" if guitars == 0 else "Rhythm"), GUITAR_PRESETS
+                # 1st guitar -> Lead, 2nd -> Rhythm, any extra -> a bonus path
+                # (Bonus Lead for lead-ish tracks, else Bonus Rhythm).
+                # A guitar is NEVER auto-assigned to Bass.
+                arr = ("Lead" if guitars == 0
+                       else "Rhythm" if guitars == 1
+                       else _guess_bonus_kind(name))
+                tones = GUITAR_PRESETS
                 if preset not in tones:
-                    preset = "Distortion - JCM800" if guitars == 0 else "Crunch - Orange"
+                    preset = ("Distortion - JCM800" if guitars == 0
+                              else "Crunch - Orange")
                 guitars += 1
             row = {"index": i, "var_include": tk.BooleanVar(value=True),
                    "var_arr": tk.StringVar(value=arr),
-                   "var_tone": tk.StringVar(value=preset)}
+                   "var_tone": tk.StringVar(value=preset),
+                   "tone_changes": []}
             r = len(track_rows) + 1
             tk.Checkbutton(arr_grid, variable=row["var_include"],
                            bg=COL["card"], activebackground=COL["card"],
@@ -6125,30 +7185,73 @@ def run_gui():
             styled(tk.Label(arr_grid, text=f"{name}  ({tuning_str})",
                             font=("Segoe UI", 9), anchor="w"),
                    fg="fg", bg="card").grid(row=r, column=1, sticky="w", padx=6, pady=3)
-            ttk.Combobox(arr_grid, textvariable=row["var_arr"], width=9,
+            ttk.Combobox(arr_grid, textvariable=row["var_arr"], width=13,
                          state="readonly",
-                         values=["Lead", "Rhythm", "Bass", "Skip"]).grid(
+                         values=["Lead", "Rhythm", "Bonus Lead", "Bonus Rhythm",
+                                 "Bass", "Skip"]).grid(
                 row=r, column=2, padx=6, pady=3)
             ttk.Combobox(arr_grid, textvariable=row["var_tone"], width=22,
                          state="readonly", values=tones).grid(
                 row=r, column=3, padx=6, pady=3)
+            tc_btn = tk.Button(arr_grid, text="Default only", font=("Segoe UI", 8),
+                               relief="flat", bd=0, padx=8, pady=3, cursor="hand2",
+                               bg=COL["card2"], fg=COL["accent"],
+                               activebackground=COL["border_hi"])
+            tc_btn.configure(command=lambda row=row, tones=tones, b=tc_btn:
+                              _open_tone_changes(row, tones, b))
+            tc_btn.grid(row=r, column=4, padx=6, pady=3)
             track_rows.append(row)
 
-        # Deduplicate arrangement types so no two active tracks share one
+        # Deduplicate arrangement slots, but NEVER move a guitar into the Bass
+        # slot or a bass into a guitar slot. Lead/Rhythm/Bass are unique; extra
+        # guitars collapse onto "Bonus Rhythm" (multiple bonus rhythms are OK).
         _used_arrs = {}
         for row in track_rows:
             a = row["var_arr"].get()
             if a == "Skip":
                 continue
-            if a in _used_arrs:
-                # Find the first free slot; if all three taken, set to Skip
-                for _cand in ("Lead", "Rhythm", "Bass"):
+            is_bass  = ARR_KIND.get(a) == "bass"
+            is_bonus = a in ARR_BONUS_BASE
+            # Bonus paths may repeat; Lead/Rhythm/Bass must each be unique.
+            if not is_bonus and a in _used_arrs:
+                if is_bass:
+                    # Only one Bass path; extra bass tracks -> Skip.
+                    row["var_arr"].set("Skip"); continue
+                # Guitar: take a free primary slot, else fall back to a bonus path.
+                for _cand in ("Lead", "Rhythm"):
                     if _cand not in _used_arrs:
                         row["var_arr"].set(_cand); a = _cand; break
                 else:
-                        row["var_arr"].set("Skip")
-            else:
+                    a = _guess_bonus_kind("")  # Bonus Rhythm by default
+                    row["var_arr"].set(a)
+            if not (a in ARR_BONUS_BASE):
                 _used_arrs[a] = True
+
+        # Auto-skip bonus guitar paths that are too sparse to be worth a separate
+        # arrangement (e.g. a track with only a few chords). Compare note counts
+        # against the busiest included track.
+        try:
+            counts = {}
+            for row in track_rows:
+                if row["var_arr"].get() == "Skip":
+                    continue
+                try:
+                    counts[row["index"]] = len(gp.track_beats(row["index"], 0.0)[0])
+                except Exception:
+                    counts[row["index"]] = 0
+            if counts:
+                busiest = max(counts.values()) or 1
+                for row in track_rows:
+                    if row["var_arr"].get() in ARR_BONUS_BASE:
+                        c = counts.get(row["index"], 0)
+                        if c < max(16, 0.2 * busiest):
+                            row["var_arr"].set("Skip")
+                            nm = " ".join((gp.tracks[row["index"]].findtext("Name")
+                                           or "track").split())
+                            log(f"  [arr] '{nm}' -> Skip ({c} notes; too sparse for "
+                                f"a bonus path vs {busiest} on the main track)")
+        except Exception:
+            pass
 
     # ── DO BUILD ──────────────────────────────────────────────────────────────────
     def do_build():
@@ -6195,8 +7298,6 @@ def run_gui():
                     year          = vars_["year"].get(),
                     leadin        = float(vars_["leadin"].get() or 5),
                     volume        = float(vars_["volume"].get() or -8),
-                    packer_path   = vars_["packer"].get(),
-                    cst_dir       = vars_["cst"].get(),
                     appid         = vars_["appid"].get().strip() or None,
                     scroll_speed  = float(vars_["scroll_speed"].get() or 1.4),
                     pitch         = float(vars_["pitch"].get() or 0),
@@ -6204,11 +7305,11 @@ def run_gui():
                     lrc_offset    = float(vars_["lrc_offset"].get() or 0.0),
                     song_folder   = _sv.get("song_key", ""),
                     make_psarc    = bool(psarc_var.get()),
-                    use_ddc       = bool(use_ddc.get()),
-                    tracks        = [{"index":      r["index"],
-                                      "include":    r["var_include"].get(),
-                                      "arr":        r["var_arr"].get(),
-                                      "tone_label": r["var_tone"].get()}
+                    tracks        = [{"index":         r["index"],
+                                      "include":        r["var_include"].get(),
+                                      "arr":             r["var_arr"].get(),
+                                      "tone_label":      r["var_tone"].get(),
+                                      "tone_changes":    r.get("tone_changes", [])}
                                      for r in track_rows],
                 )
                 def _prog(msg):
@@ -6236,8 +7337,6 @@ def run_gui():
                 _tb = traceback.format_exc()
                 root.after(0, lambda: log("BUILD ERROR: " + str(e)))
                 root.after(0, lambda: log(_tb))
-                # Surface the crash location in the popup so it can be read/screenshotted
-                # without digging through the Log page.
                 _loc = ""
                 try:
                     _frames = [ln.strip() for ln in _tb.splitlines() if ln.strip().startswith("File ")]
@@ -6248,7 +7347,7 @@ def run_gui():
                 root.after(0, _close_bld)
             finally:
                 root.after(0, lambda: btn_rebuild.configure(
-                    state="normal", text="🎯  Sync & Verify →"))
+                    state="normal", text="\U0001f3af  Sync & Verify →"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_app_close():
