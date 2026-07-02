@@ -129,7 +129,7 @@ def _lyric_lang():
 LYRIC_LANG = None   # resolved lazily
 
 
-def ocr_region(img, psm=7, tsv=False, lang=None):
+def ocr_region(img, psm=7, tsv=False, lang=None, whitelist=None):
     if TESSERACT is None:
         if not _warned_no_tess[0]:
             _warned_no_tess[0] = True
@@ -144,6 +144,8 @@ def ocr_region(img, psm=7, tsv=False, lang=None):
     args = [TESSERACT, fn, 'stdout', '--psm', str(psm)]
     if lang:
         args += ['-l', lang]
+    if whitelist:
+        args += ['-c', f'tessedit_char_whitelist={whitelist}']
     if tsv:
         args.append('tsv')
     r = subprocess.run(args, capture_output=True, text=True,
@@ -209,9 +211,36 @@ def recognize_strip(arr):
         crop = img[max(0, ry0 - 2):ry1 + 2, :]
         txt = ocr_region(crop, psm=7).strip()
         m = re.search(r'=\s*(\d{2,3})\b', txt)
+        _sanitized_len = len(re.sub(r'[^0-9A-Za-z=]', '', txt))
         # real tempo rows contain little besides the mark; measure-number rows are long
-        if m and len(re.sub(r'[^0-9A-Za-z=]', '', txt)) <= 8:
+        if m and _sanitized_len <= 8:
             tempo = int(m.group(1))
+            # The crop still has the "=" sign and a note-value glyph (e.g. a
+            # quarter-note symbol) sitting right next to the digits. Re-OCR'ing
+            # that SAME crop with a digit whitelist often just reproduces the
+            # same wrong digits, because tesseract still has to force-fit those
+            # non-digit shapes into *some* digit - it's not an independent
+            # reading. Instead: find where "=" actually sits (via a word-level
+            # TSV pass), crop to ONLY the pixels to its right (just the tempo
+            # digits, nothing else), and re-OCR *that* - a much cleaner signal
+            # that can actually catch and correct a misread like 86 -> 40.
+            tsv = ocr_region(crop, psm=7, tsv=True)
+            eq_right = None
+            for line in tsv.splitlines()[1:]:
+                f = line.split('\t')
+                if len(f) >= 12 and '=' in f[11]:
+                    eq_right = int(f[6]) + int(f[8])  # left + width
+                    break
+            if eq_right is not None and eq_right < crop.shape[1] - 2:
+                digit_crop = crop[:, max(0, eq_right - 2):]
+                digits_txt = ocr_region(digit_crop, psm=7, whitelist='0123456789').strip()
+                dm = re.search(r'(\d{2,3})', digits_txt)
+                if dm and int(dm.group(1)) != tempo:
+                    print(f'NOTE: tempo mark was ambiguous - first read "{tempo}", but an '
+                          f'isolated re-check of just the number read "{dm.group(1)}" and is '
+                          f'more reliable, so that is being used. Please still verify the '
+                          f'BPM in RS Studio against what is printed on your PDF.')
+                    tempo = int(dm.group(1))
         ms = re.search(r'(Post[- ]?Chorus|Pre[- ]?Chorus|Intro|Verse|Chorus|Bridge|'
                        r'Outro|Interlude|Solo|Break)\s*(\d*)',
                        txt, re.I)
@@ -633,7 +662,7 @@ def compute_lyric_times(measures, lyrics, tempo):
         if not cands:
             continue
         cands.sort()
-        out.append({'t': cands[0][1], 'text': L['text']})
+        out.append({'t': cands[0][1], 'text': L['text'], 'sid': sid})
     out.sort(key=lambda o: o['t'])
     return out
 
@@ -683,20 +712,41 @@ def fetch_reference_lyrics(title, artist):
     return None
 
 
-def align_to_reference(timed, ref_text, gap=1.9):
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "to", "of", "in", "on", "at",
+    "is", "are", "was", "were", "be", "been", "being", "it", "its", "i",
+    "you", "your", "yours", "me", "my", "mine", "we", "our", "ours", "he",
+    "she", "they", "them", "his", "her", "hers", "their", "with", "for",
+    "that", "this", "these", "those", "so", "do", "did", "does", "just",
+    "not", "no", "yes", "all", "can", "will", "would", "could", "should",
+    "up", "down", "out", "than", "then", "as", "by", "from", "oh", "ooh",
+    "yeah", "na", "la", "i'm", "im", "i've", "ive", "i'd", "id", "i'll",
+    "ill", "you're", "youre", "you've", "youve", "you'll", "youll",
+    "don't", "dont", "can't", "cant", "won't", "wont", "ain't", "aint",
+}
+
+
+def align_to_reference(timed, ref_text, artist=None, gap=1.9):
     """Align OCR syllables (with times) to reference lyric lines.
-    Returns [(t, line_text)] using reference text verbatim."""
+    Returns [(t, line_text)] using reference text verbatim, or None if the
+    reference doesn't check out well enough to use.
+
+    A fetched/local reference lyric supplies the real line breaks (which
+    the PDF alone doesn't reliably encode - a printed system in a tab can
+    span more or less than one actual sung line), plus correct spelling.
+    But since a reference can come from a crowd-sourced database, every line
+    it wants to contribute has to earn its way in:
+      1. Known ad/widget phrasing (ticket ads, "you might also like",
+         "more by <artist>" carousels) is filtered out directly.
+      2. Every remaining line is cross-referenced against what the PDF's own
+         OCR actually found - a line needs real word-level support from the
+         PDF, not just a pattern match, or it's dropped outright. This is
+         the general-purpose guard: it doesn't matter what a leftover line
+         says or why it's there, if the PDF never produced anything close to
+         it, it can't be the song."""
     import difflib
-    # reference lines: drop section headers like [Chorus], keep order
-    ref_lines = [l.strip() for l in ref_text.splitlines()]
-    ref_lines = [l for l in ref_lines if l and not re.match(r'^\[.*\]$', l)]
-    ref_words = []                      # (line_idx, word)
-    for li, l in enumerate(ref_lines):
-        for w in l.split():
-            n = _norm_word(w)
-            if n:
-                ref_words.append((li, n))
-    # OCR words: join syllables (hyphen/melisma continuation) with first-syllable time
+    # OCR words first (needed below to verify each reference line against
+    # what the PDF actually contains, before any line is accepted).
     ocr_words = []                      # (t, norm)
     cur = None
     prev_cont = False
@@ -718,7 +768,83 @@ def align_to_reference(timed, ref_text, gap=1.9):
     for w in ocr_words:
         w['n'] = _norm_word(w['raw'])
     ocr_words = [w for w in ocr_words if w['n']]
-    if not ocr_words or not ref_words:
+    if not ocr_words:
+        return None
+    _ocr_norms = list({w['n'] for w in ocr_words})
+
+    # reference lines: drop section headers like [Chorus], keep order
+    ref_lines = [l.strip() for l in ref_text.splitlines()]
+    ref_lines = [l for l in ref_lines if l and not re.match(r'^\[.*\]$', l)]
+    # LRCLIB is a crowd-sourced database - some submissions were pasted
+    # straight off a lyrics site without stripping that site's own ad
+    # widgets (concert ticket ads, "you might also like" related-song
+    # teasers). Those lines would otherwise get timestamped and shown as
+    # if they were real lyrics, throwing off every line's timing after them.
+    _AD_LINE_RE = re.compile(r'^(see .+ live|get tickets? as low as)\b', re.I)
+    _cleaned, _skip_next = [], False
+    for l in ref_lines:
+        if _skip_next:
+            _skip_next = False
+            continue
+        if re.match(r'^you might also like$', l, re.I):
+            _skip_next = True   # the suggested-song title right after it too
+            continue
+        if _AD_LINE_RE.match(l):
+            continue
+        _cleaned.append(l)
+    ref_lines = _cleaned
+    # "More by <artist>" / related-track widgets don't always come with a
+    # recognizable header like "you might also like" - but they always show
+    # the literal artist name as its own standalone line, repeated, with
+    # other song titles interleaved between the repeats. Real lyrics never
+    # do that, so treat 2+ close-together standalone occurrences of the
+    # artist name as one contiguous block of site cruft and drop the whole
+    # span (including whatever's interleaved between them).
+    if artist:
+        _artist_norm = _norm_word(artist)
+        _artist_idx = [i for i, l in enumerate(ref_lines) if _norm_word(l) == _artist_norm]
+        if len(_artist_idx) >= 2:
+            _drop, _run = set(), [_artist_idx[0]]
+            for idx in _artist_idx[1:]:
+                if idx - _run[-1] <= 6:
+                    _run.append(idx)
+                else:
+                    if len(_run) >= 2:
+                        _drop.update(range(_run[0], _run[-1] + 1))
+                    _run = [idx]
+            if len(_run) >= 2:
+                _drop.update(range(_run[0], _run[-1] + 1))
+            ref_lines = [l for i, l in enumerate(ref_lines) if i not in _drop]
+
+    # General-purpose defense: cross-reference every remaining line against
+    # the PDF's own OCR'd words. Common connector words ("with", "you",
+    # "the"...) are excluded from counting as evidence, since they'll
+    # coincidentally show up in almost any text, real or not - only
+    # content-bearing words count. A short real line needs its one or two
+    # substantive words to match; a longer line needs at least 2 matches.
+    def _line_supported(line):
+        words = [_norm_word(w) for w in line.split()]
+        subst = [w for w in words if len(w) >= 3 and w not in _STOPWORDS]
+        if not subst:
+            return True
+        hits = 0
+        for w in subst:
+            if any(abs(len(w) - len(on)) <= 2
+                   and difflib.SequenceMatcher(None, w, on).ratio() >= 0.72
+                   for on in _ocr_norms):
+                hits += 1
+        return hits >= min(2, len(subst))
+    ref_lines = [l for l in ref_lines if _line_supported(l)]
+    if not ref_lines:
+        return None
+
+    ref_words = []                      # (line_idx, word)
+    for li, l in enumerate(ref_lines):
+        for w in l.split():
+            n = _norm_word(w)
+            if n:
+                ref_words.append((li, n))
+    if not ref_words:
         return None
     # DP alignment (Needleman-Wunsch, similarity = difflib ratio)
     A = [w['n'] for w in ocr_words]
@@ -811,7 +937,28 @@ def clean_lyric_token(text):
     return kept.strip()
 
 
-def write_lrc(timed, path, title, artist, gap=1.9):
+def write_lrc(timed, path, title, artist, ref_text=None, gap=1.9):
+    """Build the .lrc directly from the PDF's own OCR'd lyrics.
+
+    Lines are grouped by which printed system ('sid') each syllable came
+    from - a tab prints one lyric row per system, so that's a far more
+    reliable line break than guessing from a timing gap (a system can have
+    a legitimate long pause mid-line, and a short pause can still fall right
+    at a real line break). A big timing gap is still treated as a line break
+    too, as a backstop for the rare system whose one lyric row actually spans
+    more than one sung phrase.
+
+    If ref_text (a fetched or user-supplied reference lyric) is given, it's
+    used ONLY to spell-check individual OCR'd words that are already present
+    - a near-exact match swaps in the reference's spelling ("vou" -> "you").
+    Nothing is ever copied in wholesale from ref_text: no reference line,
+    word, or extra content can appear in the output unless the PDF's own OCR
+    already produced something close to it. That's what keeps unrelated
+    website content (ads, "related songs" widgets, wrong-song lyrics, etc.)
+    from ever leaking into the chart, regardless of what a fetched reference
+    happens to contain.
+    """
+    import difflib
     timed = [dict(s, text=clean_lyric_token(s['text'])) for s in timed]
     timed = [s for s in timed if s['text']]
     lines = []
@@ -820,12 +967,15 @@ def write_lrc(timed, path, title, artist, gap=1.9):
         w = s['text']
         word_open = (cur and cur['words'] and cur['words'][-1].endswith('-')) \
             or w.startswith('-')
-        if cur is None or ((s['t'] - cur['last']) > gap and not word_open):
+        new_line = cur is None or (not word_open and (
+            s.get('sid') != cur.get('sid') or (s['t'] - cur['last']) > gap))
+        if new_line:
             if cur:
                 lines.append(cur)
-            cur = {'t': s['t'], 'words': [], 'last': s['t']}
+            cur = {'t': s['t'], 'words': [], 'last': s['t'], 'sid': s.get('sid')}
         cur['words'].append(w)
         cur['last'] = s['t']
+        cur['sid'] = s.get('sid')
     if cur:
         lines.append(cur)
 
@@ -845,11 +995,39 @@ def write_lrc(timed, path, title, artist, gap=1.9):
         out = re.sub(r'(?<=\w)\s*[-\u2013\u2014]+\s*(?=\w)', '', out)
         return out
 
+    ref_pool = []
+    if ref_text:
+        for rl in ref_text.splitlines():
+            for rw in rl.split():
+                n = _norm_word(rw)
+                if len(n) >= 3:
+                    ref_pool.append((n, rw))
+
+    def spellcheck(word):
+        if not ref_pool:
+            return word
+        n = _norm_word(word.strip('-\u2013\u2014'))
+        if len(n) < 3:
+            return word
+        best, best_r = None, 0.0
+        for rn, rw in ref_pool:
+            if abs(len(rn) - len(n)) > 2:
+                continue
+            r = difflib.SequenceMatcher(None, n, rn).ratio()
+            if r > best_r:
+                best_r, best = r, rw
+        if best and best_r >= 0.84:
+            prefix = '-' if word.startswith('-') else ''
+            suffix = '-' if word.endswith('-') else ''
+            return prefix + best + suffix
+        return word
+
     with open(path, 'w', encoding='utf-8') as f:
         f.write('[ti:%s]\n[ar:%s]\n[re:pdf2gp]\n\n' % (title, artist))
         for L in lines:
             t = L['t']
-            f.write('[%02d:%05.2f]%s\n' % (int(t // 60), t % 60, join(L['words'])))
+            words = [spellcheck(w) for w in L['words']] if ref_pool else L['words']
+            f.write('[%02d:%05.2f]%s\n' % (int(t // 60), t % 60, join(words)))
     return len(lines)
 
 
@@ -859,7 +1037,16 @@ def convert(pdf_paths, out_path=None, lrc_path=None):
     track_data = []
     all_measures = None
     all_lyrics = None
-    tempo = None
+    # (measure_index, tempo, filename) of the EARLIEST tempo mark found in
+    # each track - NOT the first one that happens to OCR successfully. A
+    # track's very first tempo mark can fail to OCR (dropped "=" sign, etc.)
+    # while a LATER, real tempo-change mark in that same track OCRs fine;
+    # picking "whichever succeeded first" would then wrongly promote that
+    # later mid-song tempo change into the song's starting tempo. Comparing
+    # by measure position across every track (bass, lead, ...) instead means
+    # a clean read from one track can correctly stand in for another track's
+    # failed read at the same point in the song.
+    tempo_candidates = []
     for p in pdf_paths:
         title, artist, tuning = extract_meta(p)
         if first_meta is None:
@@ -867,12 +1054,13 @@ def convert(pdf_paths, out_path=None, lrc_path=None):
         strips = extract_strips(p)
         recs = [recognize_strip(a) for a in strips]
         recs = [r for r in recs if r]
-        for r in recs:
-            if r['tempo']:
-                tempo = tempo or r['tempo']
         measures, lyr = build_measures(recs)
         for m in measures:
             fit_measure(m)
+        for mi, m in enumerate(measures):
+            if m.get('tempo'):
+                tempo_candidates.append((mi, m['tempo'], os.path.basename(p)))
+                break
         warns = [(i + 1, m['warn']) for i, m in enumerate(measures) if m.get('warn')]
         nnotes = sum(len(b['notes']) for m in measures for b in m['beats'])
         print('%s: %d systems, %d measures, %d notes, %d lyric syllables'
@@ -892,6 +1080,18 @@ def convert(pdf_paths, out_path=None, lrc_path=None):
         track_data.append({'measures': measures, 'tuning': midis, 'name': name})
         if lyr and (all_lyrics is None or len(lyr) > len(all_lyrics)):
             all_lyrics, all_measures = lyr, measures
+
+    tempo = None
+    if tempo_candidates:
+        tempo_candidates.sort(key=lambda c: c[0])
+        best_mi, tempo, best_file = tempo_candidates[0]
+        others = [c for c in tempo_candidates[1:] if c[0] == best_mi and c[1] != tempo]
+        print('tempo: using %d BPM from %s (earliest tempo mark, measure %d)'
+              % (tempo, best_file, best_mi + 1))
+        if others:
+            print('NOTE: other track(s) disagree on the tempo at that same measure: '
+                  + ', '.join('%s=%d' % (f, t) for _, t, f in others)
+                  + ' - double-check the BPM against your PDF.')
 
     title, artist = first_meta
     if out_path and os.path.basename(out_path) == 'song.gp5':
@@ -930,16 +1130,25 @@ def convert(pdf_paths, out_path=None, lrc_path=None):
                 except OSError:
                     pass
         if ref is None:
-            print('NOTE: no reference lyrics (no .txt in input, auto-fetch found none).')
-            print('      The .lrc will be raw OCR text. Paste real lyrics into')
-            print('      input/lyrics.txt and re-run for a clean result.')
-        aligned = align_to_reference(timed, ref) if ref else None
+            print('NOTE: no reference lyrics found (no .txt in input, auto-fetch found '
+                  'none) - spelling will be raw OCR text with no spell-check pass.')
+        # If a reference is available, use it for line breaks and spelling -
+        # but ONLY the lines that pass verification against the PDF's own
+        # OCR (see align_to_reference()'s docstring). If nothing passes, or
+        # there's no reference at all, fall back to building lines straight
+        # from the PDF's own OCR (grouped by printed system), still
+        # spell-checked against the reference if one was found.
+        aligned = align_to_reference(timed, ref, artist) if ref else None
         if aligned:
             nl = write_lrc_ref(aligned, lrc, title, artist)
-            print('wrote %s  (%d lines, aligned to reference lyrics)' % (lrc, nl))
+            print('wrote %s  (%d lines, verified against reference lyrics)' % (lrc, nl))
         else:
-            nl = write_lrc(timed, lrc, title, artist)
-            print('wrote %s  (%d lines, %d syllables, OCR only)' % (lrc, nl, len(timed)))
+            if ref:
+                print('NOTE: reference lyrics did not check out against the PDF - '
+                      'falling back to lines built straight from the tab.')
+            nl = write_lrc(timed, lrc, title, artist, ref_text=ref)
+            print('wrote %s  (%d lines, %d syllables%s)'
+                  % (lrc, nl, len(timed), ', spell-checked against reference' if ref else ''))
     return base
 
 

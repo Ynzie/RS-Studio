@@ -856,21 +856,45 @@ def _auto_volume(audio_path, log=print):
         return None
 
 
-def _pick_clean_audio(json_lines, target_dur=None):
+def _pick_clean_audio(json_lines, target_dur=None, search_title=None, search_artist=None):
     """From yt-dlp --dump-json candidate lines, pick the best audio source.
 
-    Two factors: (1) cleanliness — avoid official music videos / live / remixes
-    whose intro SFX & crowd noise wreck transcription and sync; prefer Topic /
-    official-audio / lyric / visualizer uploads. (2) LENGTH MATCH — when
-    `target_dur` (the GP tab's content length in seconds) is given, strongly
-    prefer the candidate whose duration is closest, since Songsterr tabs are
-    timed to a specific master recording and the closest-length upload is
-    usually the right one (no end-stretching needed)."""
+    Three factors: (1) cleanliness — avoid official music videos / live /
+    remixes whose intro SFX & crowd noise wreck transcription and sync;
+    prefer Topic / official-audio / lyric / visualizer uploads. (2) LENGTH
+    MATCH — when `target_dur` (the GP tab's content length in seconds) is
+    given, strongly prefer the candidate whose duration is closest, since
+    Songsterr tabs are timed to a specific master recording and the
+    closest-length upload is usually the right one (no end-stretching
+    needed). (3) TITLE RELEVANCE — when `search_title`/`search_artist` are
+    given, heavily penalize candidates whose title doesn't actually look like
+    the requested song. This matters because the "lyric video" bonus below is
+    large enough that a wrong song by the right artist which happens to be
+    labeled a lyric video could otherwise outscore a correct-but-plainer
+    upload of the real song."""
     BAD = ("official video", "official music video", "music video", "m/v", "official mv",
            "video oficial", "vídeo oficial", "videoclip", "video musical", "musica oficial",
            "(live", "live at", "live in", "live performance", "performance",
            "en vivo", "en directo", "reaction", " cover", "remix", "sped up", "slowed",
            "nightcore", "8d audio", "fan made", "amv", "trailer", "behind the scenes")
+    _STOPWORDS = {"a", "an", "the", "of", "and", "to", "in", "on"}
+    def _title_words(s):
+        s = re.sub(r"[^a-z0-9 ]", "", (s or "").lower())
+        return [w for w in s.split() if w not in _STOPWORDS and len(w) > 1]
+    def _title_relevance(cand_title):
+        """Fraction of the search title's real words found in the candidate
+        title. Word-containment rather than whole-string similarity ratio —
+        a plain ratio() gets diluted by uploader tags/suffixes ("Official
+        Lyric Video" etc.) enough that even a totally wrong song can score
+        ~0.35-0.4 against a short search title, which isn't a low enough
+        signal to reliably catch. Containment doesn't have that problem:
+        either the song's actual title words are in there or they aren't."""
+        sw = _title_words(search_title)
+        if not sw:
+            return None
+        cw = set(_title_words(cand_title))
+        hits = sum(1 for w in sw if w in cw or any(w.startswith(c) or c.startswith(w) for c in cw))
+        return hits / len(sw)
     best, best_sc = None, None
     for i, ln in enumerate(json_lines):
         try:
@@ -878,7 +902,8 @@ def _pick_clean_audio(json_lines, target_dur=None):
         except Exception:
             continue
         chan = (str(d.get("uploader", "")) + " " + str(d.get("channel", ""))).lower()
-        hay = (str(d.get("title", "")) + " " + chan).lower()
+        cand_title = str(d.get("title", ""))
+        hay = (cand_title + " " + chan).lower()
         sc = 0.0
         if "lyric" in hay or "letra" in hay:   # LYRIC VIDEO (incl. Spanish "letra"/"con letra")
             sc += 10
@@ -892,6 +917,15 @@ def _pick_clean_audio(json_lines, target_dur=None):
         for b in BAD:
             if b in hay:
                 sc -= 5
+        # Title relevance: a wrong song shouldn't be able to win just because
+        # it's tagged "lyric video" and the real song isn't — the title still
+        # has to actually resemble what was searched for.
+        rel = _title_relevance(cand_title)
+        if rel is not None:
+            if rel < 0.5:
+                sc -= 20       # missing over half the real title's words — different song
+            elif rel < 1.0:
+                sc -= 6        # partial/truncated title match
         # Length match against the GP tab — the strongest single signal when
         # available. Closest duration wins; far-off lengths are penalised.
         if target_dur and target_dur > 0:
@@ -1245,12 +1279,18 @@ def build_project(o, log=print):
     # Plain extract_gp_total_seconds includes trailing empty bars (very common in GP files),
     # which would give a falsely long GP duration and wrong scale.
     # get_gp_content_duration stops at the last bar with real notes.
-    bpm_scale = getattr(o, "bpm_scale", 1.0)
+    # NOTE: the build worker's SimpleNamespace sets this as `bpm_factor` (matching
+    # vars_["bpm_factor"] / the Sync page's "BPM scale" field) - it was previously
+    # read here under a different name ("bpm_scale"), which never existed on `o`,
+    # so this always silently fell back to 1.0 and the Sync page's BPM scale
+    # control never actually affected the built chart's timing.
+    bpm_scale = getattr(o, "bpm_factor", 1.0)
     if o.audio_path and os.path.exists(o.audio_path):
         gp_dur  = get_gp_content_duration(o.gp_path)
         aud_dur = get_wav_duration(o.audio_path)
         if gp_dur and aud_dur and aud_dur > 1.0:
-            log(f"  [sync] GP content={gp_dur:.1f}s  Audio={aud_dur:.1f}s  (no BPM scaling applied)")
+            _scale_note = f"BPM scale x{bpm_scale:.3f} applied" if bpm_scale != 1.0 else "no BPM scaling applied"
+            log(f"  [sync] GP content={gp_dur:.1f}s  Audio={aud_dur:.1f}s  ({_scale_note})")
 
     arrangements, tones, used = [], [], set()
     # Pass audio_duration so make_arrangement can set SongLength to cover the full audio
@@ -4321,31 +4361,26 @@ def run_gui():
             active.append((s, min(fret, nfr)))
 
         # ── Fret-Hand Position: anchor box on the held hand shape ───────────
-        # A chord/riff is usually fretted as one static hand shape and picked
-        # note-by-note, not re-gripped on every single note. Using the same
-        # tight WIN as the lit-up dots made the box re-anchor on every note —
-        # it looked like one finger darting around instead of a held shape.
-        # So the box itself looks at a wider window (current phrase, not just
-        # the instant) while the dots above still only light up on WIN.
-        FHP_WIN = 0.6
-        fhp_fretted = []
-        for nd in (_sv.get("notes") or []):
-            t = nd["t"]; sus = nd.get("sus", 0.0) or 0.0
-            if not (t - FHP_WIN <= cur <= t + max(sus, FHP_WIN)):
-                continue
-            fret = nd["fret"]
-            if fret > 0:
-                fhp_fretted.append(min(fret, nfr))
-        # If the wider window spans too much (a scale run, not a chord), fall
-        # back to just what's sounding right now so the box doesn't balloon.
-        if fhp_fretted and (max(fhp_fretted) - min(fhp_fretted)) <= 5:
-            fretted = fhp_fretted
-        else:
-            fretted = [f for _s, f in active if f > 0]
+        # This used to recompute its own local "anchor" every frame from
+        # whatever notes fell in a +/-0.6s window around the playhead — a
+        # from-scratch guess that didn't match the real chart at all, since
+        # the actual export uses build_anchors() over the WHOLE note stream
+        # with proper forward-merging (an anchor covers as long a run of
+        # notes as fits a 4-fret hand span, not just what's nearby in time).
+        # That mismatch is exactly what made the box jump around and show
+        # the wrong finger for a note that's actually part of one long,
+        # steady hand position in the real chart. Now it just looks up the
+        # anchor that's actually active at the playhead from _sv["anchors"]
+        # (computed in _sv_reparse_notes with the same call the real build
+        # makes), so the preview matches what you'll actually get in-game.
         anchor = None
-        if fretted:
-            lo, hi = min(fretted), max(fretted)
-            anchor = lo if (hi - lo) <= 3 else max(1, hi - 3)
+        _anchors = _sv.get("anchors") or []
+        for _a_t, _a_fret, _a_width in _anchors:
+            if _a_t <= cur:
+                anchor = _a_fret
+            else:
+                break
+        if anchor is not None:
             bx0 = edges[anchor - 1]
             bx1 = edges[min(nfr, anchor + 3)]
             sv_fret.create_rectangle(bx0, pad_t - 6, bx1, ch - pad_b + 6,
@@ -4697,6 +4732,23 @@ def run_gui():
                 })
             _sv["notes"]     = notes
             _sv["bar_times"] = bar_times
+            # Real fret-hand-position anchors — same computation the actual
+            # build uses (group_chords + build_anchors), so the fretboard
+            # preview's FHP box matches what really ends up in the chart
+            # instead of a separate local guess (see _sv_draw_fretboard).
+            try:
+                _singles, _chords, _templ, _hints = gp2rs.group_chords(notes_rs)
+                _stream = []
+                for _n in _singles:
+                    _stream.append((_n.time, _n.fret if _n.fret > 0 else 0, _n.fret))
+                for _t, _cid, _grp in _chords:
+                    _fr = [_gn.fret for _gn in _grp if _gn.fret > 0]
+                    _stream.append((_t, min(_fr) if _fr else 0, max(_fr) if _fr else 0))
+                _stream.sort()
+                _body_end = bar_times[-1][0] if bar_times else 999.0
+                _sv["anchors"] = gp2rs.build_anchors(_stream, _body_end)
+            except Exception:
+                _sv["anchors"] = []
             n_str = _sv["n_strings"]
             out_of_range = sum(1 for nd in notes if nd["s"] < 0 or nd["s"] >= n_str)
             # Routine parse info goes to the log only — the status bar under the
@@ -4896,12 +4948,27 @@ def run_gui():
     sv_bpm_lbl = styled(tk.Label(sv_bpm_row, text="×1.000  (1.0 = no change)",
                                  font=("Segoe UI", 8)), fg="dim", bg="surface")
     sv_bpm_lbl.pack(side="left", padx=(2, 10))
+    # Reentrancy guard for the slider<->variable sync below. The slider's
+    # range (0.85-1.15) is intentionally narrow — it's for small drift nudges,
+    # not big corrections — but Tk's Scale fires its own `command` whenever
+    # .set() changes its value, INCLUDING when we call .set() ourselves just
+    # to keep the slider's visual position in sync with vars_["bpm_factor"].
+    # Without this guard, setting bpm_factor to something outside the
+    # slider's range (e.g. 2.150 from the tempo-confirm popup, or typed
+    # directly into the entry field) would get silently clamped to 1.150 by
+    # the slider and written straight back over the real value — the exact
+    # bug that made a typed-in "2.150" collapse to "1.150".
+    _sv_bpm_sync = {"guard": False}
+    def _sv_bpm_scale_cmd(v):
+        if _sv_bpm_sync["guard"]:
+            return
+        vars_["bpm_factor"].set(f"{float(v):.3f}")
     sv_bpm_scale = tk.Scale(sv_bpm_row, from_=0.850, to=1.150, resolution=0.001,
                             orient="horizontal", length=220,
                             bg=COL["surface"], fg=COL["fg"],
                             troughcolor=COL["card"], highlightthickness=0,
                             showvalue=False,
-                            command=lambda v: vars_["bpm_factor"].set(f"{float(v):.3f}"))
+                            command=_sv_bpm_scale_cmd)
     sv_bpm_scale.set(1.0)
     sv_bpm_scale.pack(side="left")
 
@@ -4932,7 +4999,11 @@ def run_gui():
     def _sv_bpm_entry_changed(*_):
         try:
             v = float(vars_["bpm_factor"].get())
-            sv_bpm_scale.set(v)
+            _sv_bpm_sync["guard"] = True
+            try:
+                sv_bpm_scale.set(v)   # clamped visually if outside 0.85-1.15; fine
+            finally:
+                _sv_bpm_sync["guard"] = False
             sv_bpm_lbl.configure(text=f"×{v:.3f}")
             _sv_reparse_notes()
         except ValueError:
@@ -5109,7 +5180,14 @@ def run_gui():
                     t2 = max(0.0, t); m = int(t2) // 60; s = t2 - m * 60
                     f.write(f"[{m:02d}:{s:05.2f}]{txt}\n")
             _sv["lrc"] = lines
-            _sv["lrc_dur"] = {}
+            # NOTE: intentionally NOT clearing lrc_dur here. The .lrc format only
+            # stores a start time per line (no end/duration field), so a dragged
+            # box-width has nowhere to be saved to disk - but wiping the in-memory
+            # override on every save (which also fires on every drag-release, since
+            # release calls this) instantly snapped resized boxes back to their
+            # default computed width the moment you let go of the drag. Keeping it
+            # in memory lets a resize persist for the rest of the session; it's
+            # still lost on restart, same as before, just not immediately.
             vars_["lyrics"].set(lrc_path)
             vars_["lrc_offset"].set("0.00")
             try: sv_lrc_val_var.set("+0.00")
@@ -5609,6 +5687,32 @@ def run_gui():
         modal.grab_set()
         _inspector_ref[0] = modal
 
+        # Windows Tk quirk: overrideredirect(True) + grab_set() can leave the app
+        # frozen/unresponsive if you Alt-Tab away and back while this modal is up
+        # (e.g. mid-YouTube-search) - a borderless window doesn't go through the
+        # normal OS focus-restore handshake, so Tk's modal grab can get stuck out
+        # of sync with real OS focus and stop taking input on return. Releasing
+        # the grab on focus-out and re-asserting it on focus-in keeps the two in
+        # sync instead of deadlocking.
+        def _modal_focus_out(_e=None):
+            try: modal.grab_release()
+            except Exception: pass
+        def _modal_focus_in(_e=None):
+            try:
+                modal.lift()
+                modal.grab_set()
+            except Exception: pass
+        modal.bind("<FocusOut>", _modal_focus_out)
+        modal.bind("<FocusIn>", _modal_focus_in)
+        # Belt-and-suspenders: overrideredirect windows are unreliable about
+        # firing their OWN focus events on Windows (that's the same quirk
+        # causing the freeze in the first place), so also bind on root — a
+        # real top-level window that reliably fires FocusOut/FocusIn when the
+        # whole app loses/regains OS focus (e.g. clicking a different window
+        # entirely, not just Alt-Tab). Unbound again in _close() below.
+        _root_focus_out_id = root.bind("<FocusOut>", _modal_focus_out, add="+")
+        _root_focus_in_id = root.bind("<FocusIn>", _modal_focus_in, add="+")
+
         # Keep modal centred on root when user moves/resizes the window
         _cfg_cbid = [None]
         def _reposition_inspector(_e=None):
@@ -5636,6 +5740,10 @@ def run_gui():
             try:
                 if _cfg_cbid[0]:
                     root.unbind("<Configure>", _cfg_cbid[0])
+            except Exception: pass
+            try:
+                root.unbind("<FocusOut>", _root_focus_out_id)
+                root.unbind("<FocusIn>", _root_focus_in_id)
             except Exception: pass
             try: modal.grab_release()
             except Exception: pass
@@ -5684,10 +5792,18 @@ def run_gui():
             if not target_url:
                 cl_title = clean_title_for_api(title)
                 cl_artist = clean_title_for_api(artist)
-                # Prefer LYRIC VIDEOS: search them first and score them highest.
-                # Only fall back to YouTube Music (clean audio) if none are found.
+                # Search cleanly for the song itself — don't force "lyric video"
+                # into the query. That used to pull in an unrelated video that
+                # merely happened to be *labeled* a lyric video (matching the
+                # extra query words) instead of the actual requested song,
+                # especially for less-popular tracks with no real lyric video.
+                # Lyrics themselves come from lrclib/Genius separately, not
+                # from the YouTube video, so there's no need to chase that
+                # label in the search query — _pick_clean_audio() still scores
+                # actual lyric-video results higher among genuine matches, and
+                # now also penalizes titles that don't resemble the search.
                 ytm_url = f"ytmsearch5:{cl_artist} {cl_title}"
-                yt_url  = f"ytsearch10:{cl_artist} {cl_title} lyric video letra"
+                yt_url  = f"ytsearch10:{cl_artist} {cl_title}"
                 def _try_search(url):
                     cmd = [ytdlp, "--dump-json", "--no-warnings", "--no-playlist", url]
                     try:
@@ -5705,8 +5821,8 @@ def run_gui():
                 # "Searching..." forever, with no error shown. Wrap it so any failure
                 # is visible instead of an invisible hang.
                 try:
-                    root.after(0, lambda: loading_lbl.configure(text="Searching YouTube for a lyric video…"))
-                    lines = _try_search(yt_url)            # lyric videos first
+                    root.after(0, lambda: loading_lbl.configure(text="Searching YouTube…"))
+                    lines = _try_search(yt_url)
                     if not lines:
                         root.after(0, lambda: loading_lbl.configure(text="Trying YouTube Music…"))
                         lines = _try_search(ytm_url)       # fallback: clean audio
@@ -5742,7 +5858,8 @@ def run_gui():
                 except Exception:
                     _gp_tab_dur = None
                 # Choose the cleanest source closest in length to the GP tab.
-                vdata = _pick_clean_audio(lines, target_dur=_gp_tab_dur)
+                vdata = _pick_clean_audio(lines, target_dur=_gp_tab_dur,
+                                          search_title=title, search_artist=artist)
                 v_title = vdata.get("title", "Unknown Title")
                 v_chan  = vdata.get("uploader", "Unknown Channel")
                 v_dur   = vdata.get("duration_string", "0:00")
@@ -6369,8 +6486,17 @@ def run_gui():
                             if not item.get("syncedLyrics"):
                                 continue
                             track_name = item.get("trackName", "")
-                            sc = (_fuzzy(item.get("artistName",""), artist) +
-                                  _fuzzy(track_name, title))
+                            title_sc = _fuzzy(track_name, title)
+                            # A near-perfect artist match (e.g. "Tigercub" == "Tigercub")
+                            # can by itself push the summed score comfortably past the
+                            # acceptance threshold below even when the TITLE is a
+                            # completely different song by that artist ("Beauty" vs
+                            # "Perfume of Decay" scored ~1.27, well past 0.3). Require
+                            # the title to independently look like a real match — an
+                            # exact artist can't buy its way past a wrong song.
+                            if title_sc < 0.45:
+                                continue
+                            sc = _fuzzy(item.get("artistName",""), artist) + title_sc
                             # Penalise results that add a version qualifier the search
                             # title doesn't have — they're a different recording.
                             if not search_has_tag and _has_version_tag(track_name):
@@ -6481,10 +6607,44 @@ def run_gui():
                                                 if depth == 0: parts.append(h[start:c]); break
                                                 i = c + 6
                                     return parts
+                                # Genius embeds non-lyric widgets (concert ticket ads,
+                                # "you might also like" song suggestions, etc.) INSIDE the
+                                # lyrics container itself. Genius marks every one of these
+                                # with data-exclude-from-selection="true" so its own "copy
+                                # lyrics" button skips them — we use that same marker to
+                                # strip them out here before flattening to plain text.
+                                def _strip_excluded(h):
+                                    out = []
+                                    i = 0
+                                    while True:
+                                        m = _re.search(
+                                            r'<[a-zA-Z]+[^>]*\bdata-exclude-from-selection="true"[^>]*>',
+                                            h[i:])
+                                        if not m:
+                                            out.append(h[i:]); break
+                                        start = i + m.start()
+                                        out.append(h[i:start])
+                                        j = i + m.end(); depth = 1
+                                        while j < len(h) and depth > 0:
+                                            o = h.find('<div', j)
+                                            c = h.find('</div>', j)
+                                            if c < 0: j = len(h); break
+                                            if 0 <= o < c:
+                                                depth += 1; j = o + 4
+                                            else:
+                                                depth -= 1; j = c + 6
+                                        i = j
+                                    return ''.join(out)
+                                # Belt-and-suspenders: known ad/widget phrasing, in case
+                                # Genius ever ships one without the exclude marker.
+                                _AD_LINE_RE = _re.compile(
+                                    r'^(see .+ live|get tickets? as low as|you might also like)\b',
+                                    _re.IGNORECASE)
                                 blocks = _extract_containers(html)
                                 if blocks:
                                     lines = []
                                     for block in blocks:
+                                        block = _strip_excluded(block)
                                         t = _re.sub(r'<br\s*/?>', '\n', block)
                                         t = _re.sub(r'<[^>]+>', '', t)
                                         t = _html.unescape(t)
@@ -6493,6 +6653,8 @@ def run_gui():
                                             if not ln or _re.match(r'^\[.{1,40}\]$', ln):
                                                 continue
                                             if _re.match(r'^\d+\s+Contributor', ln):
+                                                continue
+                                            if _AD_LINE_RE.match(ln):
                                                 continue
                                             lines.append(ln)
                                     plain = '\n'.join(lines)
@@ -6513,6 +6675,52 @@ def run_gui():
                             log(f"  [fetch] Genius fallback failed: {_eg}")
 
                     if synced_lrc:
+                        # lrclib is crowd-sourced - some submissions were pasted
+                        # straight off a lyrics site without stripping that
+                        # site's own ad widgets ("See X Live" ticket ads, "you
+                        # might also like" related-song teasers, "more by
+                        # <artist>" carousels). Strip any LRC line matching
+                        # those known patterns so they don't show up
+                        # timestamped as if real lyrics.
+                        _ad_re = re.compile(r'^(see .+ live|get tickets? as low as)\b', re.IGNORECASE)
+                        def _norm_txt(s):
+                            return re.sub(r"[^a-z0-9' ]", '', (s or '').lower()).strip()
+                        _pairs = []
+                        for _lrc_ln in synced_lrc.splitlines():
+                            _m = re.match(r'^(\[\d+:\d+(?:\.\d+)?\])(.*)$', _lrc_ln)
+                            _txt = _m.group(2).strip() if _m else _lrc_ln.strip()
+                            _pairs.append((_lrc_ln, _txt))
+                        _kept, _skip_next_lrc = [], False
+                        for _lrc_ln, _txt in _pairs:
+                            if _skip_next_lrc:
+                                _skip_next_lrc = False
+                                continue
+                            if re.match(r'^you might also like$', _txt, re.IGNORECASE):
+                                _skip_next_lrc = True
+                                continue
+                            if _ad_re.match(_txt):
+                                continue
+                            _kept.append((_lrc_ln, _txt))
+                        # "More by <artist>" carousels don't always have a
+                        # recognizable header - but always show the literal
+                        # artist name as its own line, repeated, with other
+                        # song titles interleaved. Real lyrics never do that.
+                        if o_artist:
+                            _artist_norm = _norm_txt(o_artist)
+                            _aidx = [i for i, (_, t) in enumerate(_kept) if _norm_txt(t) == _artist_norm]
+                            if len(_aidx) >= 2:
+                                _drop, _run = set(), [_aidx[0]]
+                                for idx in _aidx[1:]:
+                                    if idx - _run[-1] <= 6:
+                                        _run.append(idx)
+                                    else:
+                                        if len(_run) >= 2:
+                                            _drop.update(range(_run[0], _run[-1] + 1))
+                                        _run = [idx]
+                                if len(_run) >= 2:
+                                    _drop.update(range(_run[0], _run[-1] + 1))
+                                _kept = [p for i, p in enumerate(_kept) if i not in _drop]
+                        synced_lrc = '\n'.join(ln for ln, _ in _kept)
                         lrc_dest = os.path.join(dest_dir, f"{song_key}.lrc")
                         with open(lrc_dest, "w", encoding="utf-8") as f:
                             f.write(synced_lrc)

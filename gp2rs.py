@@ -636,6 +636,76 @@ def build_anchors(items, last_time):
     return anchors
 
 
+def detect_arpeggio_handshapes(singles, templates, finger_hints, anchor_ts, song_len,
+                                max_gap=0.5, min_notes=3, max_span=3):
+    """Detect a chord shape played one string at a time (a broken/rolled
+    chord - e.g. a triad picked note-by-note instead of strummed together)
+    and add a handShape spanning the run, WITHOUT changing how the notes
+    themselves are written. This matches how official Rocksmith DLC
+    represents arpeggios: the individual notes stay plain <note> elements
+    (correct, since they really are played one at a time) - only the
+    on-screen chord-box overlay needs a handShape pointing at a chordTemplate
+    that matches the shape.
+
+    A run of consecutive singles (sorted by time) qualifies when: each note
+    lands on a string not already used earlier in the run (a real arpeggio
+    moves across strings — it doesn't repeat one, which is what separates
+    this from an ordinary scale/melodic run), consecutive notes are close
+    together in time (<= max_gap seconds), there are at least `min_notes` of
+    them, and the resulting fret shape is tight enough to be a real chord
+    voicing (span <= max_span frets, excluding open strings).
+
+    Reuses the same chordTemplate slot if this exact shape already exists
+    elsewhere in the song (e.g. it's also played as a real simultaneous
+    chord somewhere), otherwise registers a new one — mutates `templates`
+    and `finger_hints` in place, same convention as group_chords().
+    Returns a list of (chordId, startTime, endTime) handShape tuples.
+    """
+    import bisect as _bis
+    tindex = {tuple(f): i for i, f in enumerate(templates)}
+    new_handshapes = []
+    ordered = sorted(singles, key=lambda nn: nn.time)
+    i, n = 0, len(ordered)
+    while i < n:
+        run = [ordered[i]]
+        used_strings = {ordered[i].string}
+        j = i + 1
+        while j < n:
+            gap = ordered[j].time - run[-1].time
+            if gap <= 0 or gap > max_gap:
+                break
+            if ordered[j].string in used_strings:
+                break
+            run.append(ordered[j])
+            used_strings.add(ordered[j].string)
+            j += 1
+        if len(run) >= min_notes:
+            fretted = [r.fret for r in run if r.fret > 0]
+            if len(fretted) >= 2 and (max(fretted) - min(fretted)) <= max_span:
+                frets = [-1] * 6
+                for r in run:
+                    frets[r.string] = r.fret
+                key = tuple(frets)
+                if key not in tindex:
+                    tindex[key] = len(templates)
+                    templates.append(key)
+                    hints = [None] * 6
+                    for r in run:
+                        hints[r.string] = getattr(r, "finger", None)
+                    finger_hints.append(hints)
+                cid = tindex[key]
+                t0 = run[0].time
+                last = run[-1]
+                t1 = min(t0 + max(last.sustain or last.dur * 0.8, 0.05), song_len)
+                _i2 = _bis.bisect_right(anchor_ts, t0 + 1e-4)
+                if _i2 < len(anchor_ts):
+                    t1 = min(t1, anchor_ts[_i2])
+                if t1 > t0:
+                    new_handshapes.append((cid, t0, t1))
+        i = j
+    return new_handshapes
+
+
 def map_section(text):
     t = (text or "").strip().lower()
     for rx, name in RS_SECTION_MAP:
@@ -834,6 +904,15 @@ def make_arrangement(gp, ti, args):
         if end <= t:
             end = t + 0.05
         handshapes.append((cid, t, end))
+
+    # Arpeggiated chord shapes: notes picked one string at a time instead of
+    # strummed together never get grouped by group_chords() (it only groups
+    # exact-same-time notes), so a chord shape played that way was showing no
+    # chord box at all in-game. Detect those runs and add matching handShapes
+    # (templates/finger_hints are extended in place) without touching how the
+    # underlying notes are written — they correctly stay individual notes.
+    handshapes.extend(detect_arpeggio_handshapes(
+        singles, templates, finger_hints, _anchor_ts, song_len))
 
     tun, _ = gp.effective_tuning(ti)
     is_bass = args.arr == "Bass"
